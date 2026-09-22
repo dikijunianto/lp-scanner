@@ -1,0 +1,11 @@
+CREATE TABLE IF NOT EXISTS pools (id TEXT PRIMARY KEY, chain TEXT NOT NULL, protocol TEXT NOT NULL, address TEXT NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS pools_chain_protocol ON pools(chain, protocol);
+CREATE TABLE IF NOT EXISTS pool_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, pool_id TEXT NOT NULL REFERENCES pools(id), timestamp INTEGER NOT NULL, data TEXT NOT NULL, UNIQUE(pool_id,timestamp));
+CREATE INDEX IF NOT EXISTS snapshots_pool_time ON pool_snapshots(pool_id,timestamp);
+CREATE INDEX IF NOT EXISTS snapshots_time ON pool_snapshots(timestamp);
+CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, chain TEXT NOT NULL, address TEXT NOT NULL, updated_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, pool_id TEXT NOT NULL REFERENCES pools(id), timestamp INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, delivery TEXT NOT NULL DEFAULT 'local');
+CREATE INDEX IF NOT EXISTS alerts_pool_kind_time ON alerts(pool_id,kind,timestamp);
+CREATE TABLE IF NOT EXISTS scanner_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, ended_at INTEGER, status TEXT NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS candles (pool_id TEXT NOT NULL REFERENCES pools(id), timestamp INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(pool_id,timestamp));

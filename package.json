@@ -1,0 +1,48 @@
+{
+  "name": "unified-lp-scanner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"tsx watch src/api/server.ts\" \"next dev --hostname 127.0.0.1\"",
+    "build": "next build",
+    "start": "concurrently -k -n api,web \"tsx src/api/server.ts\" \"next start --hostname 127.0.0.1\"",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "scanner": "tsx src/workers/cli.ts"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "concurrently": "^10.0.5",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.3.5",
+    "prettier": "3.9.8",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "^11.2.0",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.1",
+    "drizzle-orm": "^0.45.2",
+    "fastify": "^5.12.5",
+    "next": "16.3.5",
+    "pino": "^10.3.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "recharts": "^3.10.1",
+    "zod": "^4.6.5"
+  }
+}
