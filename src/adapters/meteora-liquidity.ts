@@ -20,11 +20,12 @@ import {
 } from "../core/liquidity";
 import { ReadOnlyRpc } from "./liquidity-rpc";
 export const SOLANA_PUBLIC_RPC = "https://api.mainnet-beta.solana.com";
-const PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+export const PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const mintOwners = [
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
   "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 ];
+const mintCache = new Map<string, { value: number; until: number }>();
 const accountSchema = z
   .object({
     owner: z.string(),
@@ -32,7 +33,7 @@ const accountSchema = z
     data: z.tuple([z.string().regex(/^[A-Za-z0-9+/]*={0,2}$/), z.literal("base64")]),
   })
   .nullable();
-const accountsSchema = z.object({
+export const accountsSchema = z.object({
   context: z.object({ slot: z.number().int().nonnegative() }),
   value: z.array(accountSchema),
 });
@@ -104,7 +105,15 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
           })
           .filter((p) => p !== null);
         const keys = [
-          ...new Set(prepared.flatMap((p) => [p.pool.poolAddress, p.binAddress, p.mint0, p.mint1])),
+          ...new Set(
+            prepared.flatMap((p) => [
+              p.pool.poolAddress,
+              p.binAddress,
+              ...[p.mint0, p.mint1].filter(
+                (mint) => (mintCache.get(mint)?.until ?? 0) <= Date.now(),
+              ),
+            ]),
+          ),
         ];
         if (!keys.length) continue;
         // Pair + active bin array + both mints are reread in the same bank/context.
@@ -141,8 +150,18 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
             if (array.lbPair.toBase58() !== pool.poolAddress || !array.index.eq(row.binIndex))
               throw new Error("Bin array identity mismatch");
             const bin = getBinFromBinArray(pair.activeId, array);
-            const d0 = mintDecimals(accounts.get(row.mint0)!),
-              d1 = mintDecimals(accounts.get(row.mint1)!);
+            const getDecimals = (mint: string) => {
+              const cached = mintCache.get(mint);
+              if (cached && cached.until > Date.now()) return cached.value;
+              const value = mintDecimals(accounts.get(mint)!);
+              mintCache.set(mint, {
+                value,
+                until: Date.now() + env.TOKEN_METADATA_REFRESH_SECONDS * 1000,
+              });
+              return value;
+            };
+            const d0 = getDecimals(row.mint0),
+              d1 = getDecimals(row.mint1);
             const amount0 = tokenUnits(bin.amountX.toString(), d0),
               amount1 = tokenUnits(bin.amountY.toString(), d1);
             const pairPrice = binPairPrice(pair.activeId, pair.binStep, d0, d1);

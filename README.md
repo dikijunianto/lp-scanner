@@ -68,13 +68,13 @@ Tables: `pools`, `pool_snapshots`, `tokens`, `alerts`, `scanner_runs`, `app_sett
 
 Official documentation and live responses were inspected before implementation on 2026-09-22. References and field decisions are recorded in [docs/data-sources.md](docs/data-sources.md).
 
-| Source                           | Default behavior                                                                                       | Data limits                                                                                                                                     |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Meteora Data API                 | Paginated `/pools`, TVL ≥ $10,000, up to 1,000 pools sorted by TVL                                     | Fees, volume, metadata, dynamic fee rate, bin step and creation time. Active-bin USD enrichment for the first 40 pools via official SDK account decoding. Optional windows remain null when omitted. |
-| GeckoTerminal Base Uniswap V3    | First page of up to 20 protocol-specific pools                                                         | Pair price, TVL, volume, swap counts and pool age. Fees remain null; on-chain V3 virtual-reserve USD estimates enrich the first 20 pools.                                                       |
-| GeckoTerminal BSC PancakeSwap V3 | First page of up to 20 protocol-specific pools                                                         | Same restrictions. No paid key required.                                                                                                        |
-| Optional protocol V3 subgraph    | Preferred if a URL is configured; falls back to public discovery on failure                            | Hourly fees and volume only when every expected completed UTC hour is present. Provider/indexer fees are not a personalized LP payout.          |
-| Optional Base/BSC RPC            | Checks chain ID and block freshness, then Multicall reads current V3 state and token decimals | No transactions, signing, or wallet interaction. Discovery does not need RPC.                                                                   |
+| Source                           | Default behavior                                                                              | Data limits                                                                                                                                                                                          |
+| -------------------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Meteora Data API                 | Paginated `/pools`, TVL ≥ $10,000, up to 1,000 pools sorted by TVL                            | Fees, volume, metadata, dynamic fee rate, bin step and creation time. Active-bin USD enrichment for the first 40 pools via official SDK account decoding. Optional windows remain null when omitted. |
+| GeckoTerminal Base Uniswap V3    | First page of up to 20 protocol-specific pools                                                | Pair price, TVL, volume, swap counts and pool age. Event fees warm up for up to three eligible pools; current V3 virtual reserves and bounded depth are separate.                                    |
+| GeckoTerminal BSC PancakeSwap V3 | First page of up to 20 protocol-specific pools                                                | Same discovery limits. Bounded event fees account for emitted protocol fees where a complete window exists. No paid key required.                                                                    |
+| Optional protocol V3 subgraph    | Preferred if a URL is configured; falls back to public discovery on failure                   | Hourly fees and volume only when every expected completed UTC hour is present. Provider/indexer fees are not a personalized LP payout.                                                               |
+| Optional Base/BSC RPC            | Checks chain ID and block freshness, then Multicall reads current V3 state and token decimals | No transactions, signing, or wallet interaction. Discovery does not need RPC.                                                                                                                        |
 
 Default discovery is deliberately bounded, and the source-health panel reports caps. Set `METEORA_MAX_POOLS=0` to scan all pools matching `METEORA_MIN_TVL`; set `METEORA_MIN_TVL=0` to include low-liquidity pools. Blacklisted Meteora pools are excluded by discovery. `EVM_PAGES` accepts 1–10 pages (20 pools/page). Pagination while markets change can shift pool membership; Meteora results are deduplicated.
 
@@ -82,7 +82,7 @@ Historical OHLCV is fetched on opening a pool detail, cached for five minutes an
 
 Public APIs can be delayed, incomplete or unavailable. Observation timestamps mean when this scanner received data, not a certified block timestamp. Failed sources keep their last observation, visibly marked stale after three scan intervals. A source failure does not prevent other adapters from writing snapshots.
 
-Sprint 2 adds active-liquidity provenance to each row and pool detail, plus a **Reliable active liquidity** filter (fresh HIGH/MEDIUM; V3 estimates remain labeled). Source publication times for current indexer USD prices are unknown, so present results are MEDIUM, never HIGH.
+Sprint 2 adds active-liquidity provenance to each row and pool detail, plus a **Reliable active liquidity** filter (fresh HIGH/MEDIUM; V3 estimates remain labeled). Sprint 3 adds timestamped independent USD prices, event-derived EVM fee windows, and bounded ±1/2.5/5/10% depth. See [pricing](docs/pricing.md), [fees](docs/fees.md), and [liquidity depth](docs/liquidity-depth.md). Older indexer prices still have unknown publication times and remain explicitly LOW when no independent quote is available.
 
 ## Metric definitions
 
@@ -187,7 +187,7 @@ Back up SQLite after stopping the app; copy the whole `data` directory, includin
 ## Reliability and troubleshooting
 
 - **Empty first screen:** wait for the first scan; inspect the source-health panel and `/api/health`. No fake production rows exist.
-- **Missing fees or efficiency:** public EVM feeds do not expose fees. Liquidity is unavailable outside the enrichment budget or when state/prices fail validation. Missing, stale or zero active liquidity gives null efficiency and turnover; total TVL is never substituted.
+- **Missing fees or efficiency:** EVM event-derived fees need a full confirmed block window and timestamped historical prices; 24h windows take a day to warm up. Liquidity is unavailable outside the enrichment budget or when state/prices fail validation. Missing, stale or zero active liquidity gives null efficiency and turnover; total TVL is never substituted.
 - **No surge:** at least 30 minutes of suitable own-pool history is needed; a quiet-surge classification needs 4h price history. 24h changes need a day.
 - **No volatility/range result:** open pool details to fetch candles. Gaps and insufficient history deliberately produce unknown values.
 - **Partial source:** source fields or optional enrichments are unavailable. Other protocols continue. Old rows remain with their observation timestamp.
@@ -201,12 +201,12 @@ Graceful SIGINT/SIGTERM handling stops scheduling, waits for current requests/wo
 
 ## Current limitations and next work
 
-1. Add timestamped independent USD prices and complete V3 fee windows. Extend V3 depth to bounded tick ranges for cross-protocol comparisons; virtual reserves are not deposited capital.
+1. Backfill and reconcile historical oracle observations so newly followed pools can show trustworthy 4h/24h event fee windows sooner. Preserve the current no-guessing rule for gaps and stale prices.
 2. Add optional token-risk sources for token creation time, authorities, concentration, transfer restrictions and verified contract source. Current coverage is intentionally incomplete.
 3. Add a budgeted background OHLCV crawl and verified source timestamps. At present candles are fetched on detail views and stored.
 4. Validate optional subgraph/RPC integrations against user-selected providers; default public feeds are the live path verified locally. Add pool discovery beyond capped ranked pages where needed.
 5. Add Uniswap V4 only after modeling pool IDs, hooks and dynamic fees explicitly; **V4 is not implemented**. Other EVM chains can instantiate `EvmPoolAdapter` with a chain/DEX configuration.
-6. Add bin/tick-aware range geometry and a point-in-time replay/backtest using retained snapshots and alerts. The initial simulator is descriptive only.
+6. Add a point-in-time replay/backtest using retained price, fee, depth, snapshot and alert observations. The current range simulator is descriptive only.
 7. For large archives, use normalized metric columns, aggregation and PostgreSQL. The current repository stores validated snapshot JSON for MVP flexibility, with indexed pool/time access.
 
 No Docker is required. No autonomous trading features are included.

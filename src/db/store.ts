@@ -8,7 +8,29 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import { and, asc, desc, eq, gte, lt, lte, or } from "drizzle-orm";
 import * as schema from "./schema";
 import { env } from "../config/env";
-import type { Snapshot, Candle } from "../core/model";
+import type { Snapshot, Candle, PriceRecord, FeeWindow, Window, Confidence } from "../core/model";
+export interface FeeEventRow {
+  poolId: string;
+  blockNumber: number;
+  blockHash: string;
+  txHash: string;
+  logIndex: number;
+  timestamp: number;
+  volumeUsd: number | null;
+  feesUsd: number | null;
+  confidence: Confidence;
+}
+export interface DepthRow {
+  depth1PctUsd: number | null;
+  depth2_5PctUsd: number | null;
+  depth5PctUsd: number | null;
+  depth10PctUsd: number | null;
+  confidence: Confidence;
+  source: string;
+  updatedAt: number;
+  blockId: string;
+  stateKey: string;
+}
 export function hydrateSnapshot(data: Snapshot): Snapshot {
   return {
     ...data,
@@ -55,6 +77,138 @@ export function createStore(path = env.DATABASE_PATH) {
   return {
     db,
     close: () => sqlite.close(),
+    savePrices(records: PriceRecord[]) {
+      const insert = sqlite.prepare(`INSERT INTO price_observations
+        (chain, asset_address, symbol, price_usd, source, source_timestamp, observed_at, block_number, confidence)
+        VALUES (@chain, @assetAddress, @symbol, @priceUsd, @source, @sourceTimestamp, @observedAt, @blockNumber, @confidence)`);
+      sqlite.transaction(() => {
+        for (const record of records) insert.run(record);
+      })();
+    },
+    priceAt(chain: string, address: string, at: number, maxAgeMs: number): PriceRecord | null {
+      const row = sqlite
+        .prepare(
+          `SELECT * FROM price_observations WHERE chain=? AND asset_address=?
+        AND source_timestamp BETWEEN ? AND ? AND confidence IN ('HIGH','MEDIUM')
+        ORDER BY ABS(source_timestamp - ?) LIMIT 1`,
+        )
+        .get(chain, address, at - maxAgeMs, at, at) as Record<string, unknown> | undefined;
+      return row
+        ? {
+            chain: String(row.chain),
+            assetAddress: String(row.asset_address),
+            symbol: String(row.symbol),
+            priceUsd: Number(row.price_usd),
+            source: String(row.source),
+            sourceTimestamp: Number(row.source_timestamp),
+            observedAt: Number(row.observed_at),
+            blockNumber: row.block_number == null ? null : String(row.block_number),
+            confidence: row.confidence as Confidence,
+          }
+        : null;
+    },
+    feeCursor(
+      poolId: string,
+    ): {
+      blockNumber: number;
+      blockHash: string;
+      startBlock: number;
+      startTime: number;
+      endTime: number;
+    } | null {
+      return (
+        (sqlite
+          .prepare(
+            `SELECT block_number AS blockNumber, block_hash AS blockHash,
+        start_block AS startBlock, start_time AS startTime, end_time AS endTime
+        FROM fee_cursors WHERE pool_id=?`,
+          )
+          .get(poolId) as
+          | {
+              blockNumber: number;
+              blockHash: string;
+              startBlock: number;
+              startTime: number;
+              endTime: number;
+            }
+          | undefined) ?? null
+      );
+    },
+    rollbackFees(poolId: string, fromBlock: number) {
+      sqlite.transaction(() => {
+        sqlite
+          .prepare("DELETE FROM fee_events WHERE pool_id=? AND block_number>=?")
+          .run(poolId, fromBlock);
+        sqlite.prepare("DELETE FROM fee_windows WHERE pool_id=?").run(poolId);
+        sqlite.prepare("DELETE FROM fee_cursors WHERE pool_id=?").run(poolId);
+      })();
+    },
+    rewindFeeCursor(
+      poolId: string,
+      blockNumber: number,
+      blockHash: string,
+      startBlock: number,
+      startTime: number,
+    ) {
+      sqlite
+        .prepare(
+          `UPDATE fee_cursors SET block_number=?, block_hash=?, start_block=?,
+        start_time=?, end_time=?, updated_at=? WHERE pool_id=?`,
+        )
+        .run(blockNumber, blockHash, startBlock, startTime, startTime, Date.now(), poolId);
+    },
+    saveFeeBatch(
+      poolId: string,
+      events: FeeEventRow[],
+      startBlock: number,
+      startTime: number,
+      blockNumber: number,
+      blockHash: string,
+      endTime: number,
+    ) {
+      sqlite.transaction(() => {
+        const insert = sqlite.prepare(`INSERT OR REPLACE INTO fee_events
+          (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence)
+          VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence)`);
+        for (const event of events) insert.run(event);
+        sqlite
+          .prepare(
+            `INSERT INTO fee_cursors VALUES (?,?,?,?,?,?,?) ON CONFLICT(pool_id)
+          DO UPDATE SET block_number=excluded.block_number, block_hash=excluded.block_hash,
+          end_time=excluded.end_time, updated_at=excluded.updated_at`,
+          )
+          .run(poolId, blockNumber, blockHash, startBlock, startTime, endTime, Date.now());
+      })();
+    },
+    feeEvents(poolId: string, from: number, to: number): FeeEventRow[] {
+      const rows = sqlite
+        .prepare(
+          `SELECT pool_id AS poolId, block_number AS blockNumber,
+        block_hash AS blockHash, tx_hash AS txHash, log_index AS logIndex, timestamp,
+        volume_usd AS volumeUsd, fees_usd AS feesUsd, confidence FROM fee_events
+        WHERE pool_id=? AND timestamp>=? AND timestamp<=? ORDER BY block_number,log_index`,
+        )
+        .all(poolId, from, to);
+      return rows as FeeEventRow[];
+    },
+    saveFeeWindow(poolId: string, window: Window, data: FeeWindow) {
+      sqlite
+        .prepare("INSERT OR REPLACE INTO fee_windows VALUES (?,?,?,?)")
+        .run(poolId, window, data.windowEnd, JSON.stringify(data));
+    },
+    latestDepth(poolId: string): DepthRow | null {
+      const row = sqlite
+        .prepare(
+          "SELECT data FROM depth_observations WHERE pool_id=? ORDER BY timestamp DESC LIMIT 1",
+        )
+        .get(poolId) as { data: string } | undefined;
+      return row ? (JSON.parse(row.data) as DepthRow) : null;
+    },
+    saveDepth(poolId: string, data: DepthRow) {
+      sqlite
+        .prepare("INSERT OR REPLACE INTO depth_observations VALUES (?,?,?,?)")
+        .run(poolId, data.blockId, data.updatedAt, JSON.stringify(data));
+    },
     save(items: Snapshot[]) {
       db.transaction((tx) => {
         for (const data of items) {

@@ -39,11 +39,12 @@ const selectors = [
   "0xd0c93a7c",
   "0xc45a0155",
 ];
+const decimalsCache = new Map<string, { value: number; until: number }>();
 export const multicallAbi = new Interface([
   "function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) payable returns (tuple(bool success,bytes returnData)[] returnData)",
 ]);
 // eth_call only: no transaction or wallet. Limit each aggregate to 140 read calls.
-async function readContracts(
+export async function readContracts(
   rpc: ReadOnlyRpc,
   calls: { to: string; data: string }[],
   block: string,
@@ -147,19 +148,13 @@ export async function enrichEvmLiquidity(
       }
     });
     const addresses = [...new Set(decoded.flatMap((s) => (s ? [s.token0, s.token1] : [])))];
+    const missingDecimals = addresses.filter(
+      (address) => (decimalsCache.get(`${chain}:${address}`)?.until ?? 0) <= Date.now(),
+    );
     const rawDecimals = await readContracts(
       rpc,
-      addresses.map((to) => ({ to, data: "0x313ce567" })),
+      missingDecimals.map((to) => ({ to, data: "0x313ce567" })),
       block.number,
-    );
-    const tokenDecimals = new Map(
-      addresses.map((address, i) => {
-        try {
-          return [address, decimals(Number(words(rawDecimals[i], 1)[0]))] as const;
-        } catch {
-          return [address, null] as const;
-        }
-      }),
     );
     // Re-read this exact block hash after all calls to catch a reorg or inconsistent backend.
     const finalBlock = blockSchema.parse(
@@ -169,6 +164,22 @@ export async function enrichEvmLiquidity(
       throw new Error("Block changed during read");
     if (!fresh(blockTime, Date.now(), env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS * 1000))
       throw new Error("Stale RPC block");
+    for (let i = 0; i < missingDecimals.length; i++) {
+      try {
+        const value = decimals(Number(words(rawDecimals[i], 1)[0]));
+        decimalsCache.set(`${chain}:${missingDecimals[i]}`, {
+          value,
+          until: Date.now() + env.TOKEN_METADATA_REFRESH_SECONDS * 1000,
+        });
+      } catch {
+        /* Invalid token metadata is not cached. */
+      }
+    }
+    const tokenDecimals = new Map(
+      addresses.map(
+        (address) => [address, decimalsCache.get(`${chain}:${address}`)?.value ?? null] as const,
+      ),
+    );
     for (const state of decoded) {
       if (!state) continue;
       const { pool } = state;

@@ -142,6 +142,13 @@ export function priceEvidence(
   maxAge: number,
   maxDivergence: number,
 ) {
+  if (
+    [t0, t1].some(
+      (t) =>
+        t.usdPriceConfidence !== undefined && !["HIGH", "MEDIUM"].includes(t.usdPriceConfidence),
+    )
+  )
+    throw new Error("USD pricing confidence insufficient");
   if (!fresh(t0.usdPriceObservedAt, now, maxAge) || !fresh(t1.usdPriceObservedAt, now, maxAge))
     throw new Error("USD pricing unavailable or stale");
   if (
@@ -171,13 +178,13 @@ export function applyLiquidity(
   pool.activeLiquidityUsd = value;
   pool.activeLiquiditySource =
     details.method === "DLMM_ACTIVE_BIN_V1" ? "ONCHAIN_DERIVED" : "ESTIMATED";
-  // Both indexers lack a source publication timestamp. Never claim HIGH confidence from retrieval time alone.
+  // State is block/slot pinned; the valuation and V3 interpretation still warrant MEDIUM.
   pool.activeLiquidityConfidence = "MEDIUM";
   pool.activeLiquidityUpdatedAt = details.blockTime;
   pool.activeLiquidityExpiresAt = expiresAt;
   pool.activeLiquidityDetails = details;
   pool.activeLiquidityReason =
     details.method === "DLMM_ACTIVE_BIN_V1"
-      ? "Actual active-bin balances; indexer USD price freshness is unverified"
-      : "Virtual reserves from current L and price; not deposited capital or total TVL";
+      ? "Actual active-bin balances valued with timestamped independent USD prices"
+      : "Virtual reserves from current L and price, valued with timestamped USD prices; not deposited capital or total TVL";
 }
