@@ -1,3 +1,4 @@
+import { expireLiquidity } from "../core/analytics";
 import Fastify from "fastify";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
@@ -80,8 +81,7 @@ app.get("/pools/:id", async (request, reply) => {
     { surgeMultiplier: env.SURGE_MULTIPLIER, minHourlyFees: env.SURGE_MIN_HOURLY_FEES },
   );
   return {
-    pool,
-    metrics,
+    ...expireLiquidity({ pool, metrics }, Date.now()),
     history,
     candles,
     candleError,

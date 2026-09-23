@@ -9,6 +9,8 @@ export const geckoPoolSchema = z.object({
   attributes: z.object({
     address,
     name: z.string().max(300),
+    base_token_price_usd: optionalPositive,
+    quote_token_price_usd: optionalPositive,
     base_token_price_quote_token: optionalPositive,
     reserve_in_usd: optionalPositive,
     pool_created_at: z.string().nullish(),
@@ -40,6 +42,16 @@ export function normalizeEvm(raw: unknown, config: EvmConfig, now = Date.now()):
   const tokenAddress = (id: string) => address.parse(id.replace(`${config.chain}_`, ""));
   const token0 = emptyToken(tokenAddress(data.relationships.base_token.data.id), names[0] || "?");
   const token1 = emptyToken(tokenAddress(data.relationships.quote_token.data.id), names[1] || "?");
+  Object.assign(token0, {
+    usdPrice: a.base_token_price_usd,
+    usdPriceObservedAt: a.base_token_price_usd ? now : null,
+    usdPriceSource: "GeckoTerminal",
+  });
+  Object.assign(token1, {
+    usdPrice: a.quote_token_price_usd,
+    usdPriceObservedAt: a.quote_token_price_usd ? now : null,
+    usdPriceSource: "GeckoTerminal",
+  });
   const p = emptyPool(
     {
       chain: config.chain,
@@ -179,45 +191,9 @@ export class EvmPoolAdapter implements Adapter {
           throw new Error("Upstream response failed validation");
         if (result.data.length < 20) break;
       }
-      notes.push("Public discovery: fees, active liquidity and unique traders unavailable");
-    }
-    if (this.config.rpc) {
-      try {
-        const rpc = new HttpClient(200);
-        const chain = await rpc.json(this.config.rpc, z.object({ result: z.string() }), {
-          body: { jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] },
-        });
-        if (Number(chain.result) !== this.config.chainId) throw new Error("Wrong RPC chain");
-        for (const p of pools.slice(0, env.RPC_ENRICH_LIMIT)) {
-          const response = await rpc.json(
-            this.config.rpc,
-            z.array(
-              z.object({
-                id: z.number(),
-                result: z
-                  .string()
-                  .regex(/^0x[a-fA-F0-9]{64}$/)
-                  .optional(),
-              }),
-            ),
-            {
-              body: ["0xddca3f43", "0xd0c93a7c"].map((data, id) => ({
-                jsonrpc: "2.0",
-                id,
-                method: "eth_call",
-                params: [{ to: p.poolAddress, data }, "latest"],
-              })),
-              ttl: 3600000,
-            },
-          );
-          const fee = response.find((r) => r.id === 0)?.result,
-            tick = response.find((r) => r.id === 1)?.result;
-          if (fee && Number(BigInt(fee)) <= 1e6) p.feeTier = Number(BigInt(fee)) / 1e6;
-          if (tick && Number(BigInt(tick)) < 1e6) p.tickSpacing = Number(BigInt(tick));
-        }
-      } catch {
-        notes.push("Optional RPC enrichment unavailable; discovery continues");
-      }
+      notes.push(
+        "Public discovery: fees and unique traders unavailable; liquidity enriched separately through RPC",
+      );
     }
     notes.push(`Discovery capped at ${env.EVM_PAGES * 20} pools per chain`);
     return { pools, notes };

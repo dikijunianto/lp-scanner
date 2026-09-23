@@ -1,3 +1,4 @@
+import { liquidityDefaults, type LiquidityDetails, type LiquiditySource } from "./liquidity";
 export const windows = ["5m", "30m", "1h", "4h", "24h"] as const;
 export type Window = (typeof windows)[number];
 export const windowMs: Record<Window, number> = {
@@ -11,6 +12,10 @@ export type Nullable = number | null;
 export interface Token {
   address: string;
   symbol: string;
+  decimals: Nullable;
+  usdPrice: Nullable;
+  usdPriceObservedAt: Nullable;
+  usdPriceSource: string | null;
   ageHours: Nullable;
   mintAuthority: boolean | null;
   freezeAuthority: boolean | null;
@@ -32,6 +37,12 @@ export type Pool = {
   priceUnit: string;
   tvlUsd: Nullable;
   activeLiquidityUsd: Nullable;
+  activeLiquiditySource: LiquiditySource;
+  activeLiquidityConfidence: "HIGH" | "MEDIUM" | "LOW" | "UNAVAILABLE";
+  activeLiquidityUpdatedAt: Nullable;
+  activeLiquidityExpiresAt: Nullable;
+  activeLiquidityReason: string;
+  activeLiquidityDetails: LiquidityDetails | null;
   swapCount: Nullable;
   uniqueTraderCount: Nullable;
   realizedVolatility1h: Nullable;
@@ -102,7 +113,7 @@ export function emptyPool(
     price: null,
     priceUnit: `${input.token1.symbol} per ${input.token0.symbol}`,
     tvlUsd: null,
-    activeLiquidityUsd: null,
+    ...liquidityDefaults,
     swapCount: null,
     uniqueTraderCount: null,
     realizedVolatility1h: null,
@@ -119,6 +130,10 @@ export function emptyPool(
 export const emptyToken = (address: string, symbol: string): Token => ({
   address,
   symbol,
+  decimals: null,
+  usdPrice: null,
+  usdPriceObservedAt: null,
+  usdPriceSource: null,
   ageHours: null,
   mintAuthority: null,
   freezeAuthority: null,

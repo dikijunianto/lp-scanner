@@ -1,3 +1,6 @@
+import { expireLiquidity } from "../core/analytics";
+import { liquidityDefaults } from "../core/liquidity";
+import { emptyToken } from "../core/model";
 import Database from "better-sqlite3";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -6,6 +9,29 @@ import { and, asc, desc, eq, gte, lt, lte, or } from "drizzle-orm";
 import * as schema from "./schema";
 import { env } from "../config/env";
 import type { Snapshot, Candle } from "../core/model";
+export function hydrateSnapshot(data: Snapshot): Snapshot {
+  return {
+    ...data,
+    pool: {
+      ...liquidityDefaults,
+      ...data.pool,
+      token0: {
+        ...emptyToken(data.pool.token0Address, data.pool.token0.symbol),
+        ...data.pool.token0,
+      },
+      token1: {
+        ...emptyToken(data.pool.token1Address, data.pool.token1.symbol),
+        ...data.pool.token1,
+      },
+    },
+  };
+}
+// Expire only the current read view. Persisted history and its historical ratios remain unchanged.
+export function currentSnapshot(data: Snapshot, now = Date.now()): Snapshot {
+  const s = hydrateSnapshot(data);
+  return expireLiquidity(s, now);
+}
+
 export function createStore(path = env.DATABASE_PATH) {
   if (path !== ":memory:") mkdirSync(dirname(resolve(path)), { recursive: true });
   const sqlite = new Database(path);
@@ -70,10 +96,11 @@ export function createStore(path = env.DATABASE_PATH) {
         .select()
         .from(schema.pools)
         .all()
-        .map((row) => row.data);
+        .map((row) => currentSnapshot(row.data));
     },
     get(id: string) {
-      return db.select().from(schema.pools).where(eq(schema.pools.id, id)).get()?.data;
+      const row = db.select().from(schema.pools).where(eq(schema.pools.id, id)).get();
+      return row ? currentSnapshot(row.data) : undefined;
     },
     analyticsHistory(id: string, now: number) {
       return db
@@ -94,7 +121,7 @@ export function createStore(path = env.DATABASE_PATH) {
         )
         .orderBy(asc(schema.snapshots.timestamp))
         .all()
-        .map((row) => row.data);
+        .map((row) => hydrateSnapshot(row.data));
     },
     history(id: string, since = Date.now() - 86400000, limit = 2000) {
       return db
@@ -105,7 +132,7 @@ export function createStore(path = env.DATABASE_PATH) {
         .limit(limit)
         .all()
         .reverse()
-        .map((row) => row.data);
+        .map((row) => hydrateSnapshot(row.data));
     },
     candles(id: string) {
       return db

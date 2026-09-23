@@ -6,6 +6,10 @@ export function useData<T>(url: string, interval = 30000) {
     [error, setError] = useState<string | null>(null),
     [version, setVersion] = useState(0);
   useEffect(() => {
+    const clock = setInterval(() => setObservedAt(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, []);
+  useEffect(() => {
     let active = true;
     let timer: ReturnType<typeof setTimeout>;
     const abort = new AbortController();

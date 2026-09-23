@@ -17,6 +17,6 @@ Verified on macOS arm64, Node.js 24.1.0, pnpm 11.19.0.
 - At a 390px viewport, both dashboard and detail document widths stayed within the viewport; wide tables scroll within their containers.
 - Graceful stop/restart preserved snapshots.
 
-Meteora, GeckoTerminal, and keyless fallback paths were verified live. Optional user-supplied GraphQL/RPC providers and Telegram delivery were not live-tested without configuration. Telegram tests disable sending. No 30-minute live surge or 24-hour continuous-runtime soak is claimed; those algorithms are verified with deterministic fixtures. V4, active-liquidity USD enrichment and advanced token-risk checks remain outside current coverage; see README limitations.
+Meteora, GeckoTerminal, and keyless fallback paths were verified live. Optional user-supplied GraphQL/RPC providers and Telegram delivery were not live-tested without configuration. Telegram tests disable sending. No 30-minute live surge or 24-hour continuous-runtime soak is claimed; those algorithms are verified with deterministic fixtures. This is the Sprint 1 baseline. Sprint 2 active-liquidity results are documented in [active-liquidity.md](active-liquidity.md). V4 and advanced token-risk checks remain outside current coverage; see README limitations.
 
 The application was left running locally. No LaunchAgent was installed, so it is not configured to restart after login or reboot.

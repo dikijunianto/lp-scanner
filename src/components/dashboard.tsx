@@ -1,4 +1,7 @@
 "use client";
+import { expireLiquidity } from "@/core/analytics";
+import { LiquidityValue } from "./liquidity";
+import { reliableLiquidity } from "@/core/liquidity";
 import { useState } from "react";
 import Link from "next/link";
 import type { Snapshot } from "@/core/model";
@@ -59,7 +62,8 @@ export function Dashboard() {
     [tokenAge, setTokenAge] = useState(""),
     [poolAge, setPoolAge] = useState("");
   const [onlySurges, setOnlySurges] = useState(false);
-  const pools = data?.pools ?? [];
+  const [onlyReliable, setOnlyReliable] = useState(false);
+  const pools = (data?.pools ?? []).map((s) => expireLiquidity(s, observedAt));
   const knownMin = (value: number | null, min: string) =>
     min === "" || (value !== null && value >= Number(min));
   const filtered = pools.filter(
@@ -75,7 +79,8 @@ export function Dashboard() {
       (risk === "" || m.risk <= Number(risk)) &&
       knownMin(p.tokenAge, tokenAge) &&
       knownMin(p.poolAge, poolAge) &&
-      (!onlySurges || m.surge),
+      (!onlySurges || m.surge) &&
+      (!onlyReliable || reliableLiquidity(p, observedAt)),
   );
   const value = (s: Snapshot): number | null => {
     switch (sort) {
@@ -192,6 +197,17 @@ export function Dashboard() {
               </button>
             ))}
           </nav>
+          <label
+            className="surge-toggle"
+            title="Fresh on-chain state, available USD pricing and price-consistency checks. MEDIUM/HIGH confidence; V3 remains an estimate."
+          >
+            <input
+              type="checkbox"
+              checked={onlyReliable}
+              onChange={(e) => setOnlyReliable(e.target.checked)}
+            />
+            Reliable active liquidity
+          </label>
           <label className="surge-toggle">
             <input
               type="checkbox"
@@ -308,7 +324,9 @@ export function Dashboard() {
                   </td>
                   <td title={p.priceUnit}>{price(p.price)}</td>
                   <td>{usd(p.tvlUsd)}</td>
-                  <td className="muted">{usd(p.activeLiquidityUsd)}</td>
+                  <td>
+                    <LiquidityValue pool={p} now={observedAt} />
+                  </td>
                   <td>{usd(p.volume1h)}</td>
                   <td>{usd(p.fees1h)}</td>
                   <td>{efficiency(m.feeEfficiency1h)}</td>
@@ -398,8 +416,9 @@ export function Dashboard() {
             with sparse data do not imply low risk.
           </p>
           <p className="muted">
-            Active liquidity is never replaced by TVL. Trend metrics warm up over 4 hours; 24h
-            history needs a full day.
+            Active liquidity is never replaced by TVL. V3 virtual reserves and DLMM active bins are
+            different denominators; compare within the same method. Trend metrics warm up over 4
+            hours; 24h history needs a full day.
           </p>
         </div>
       </section>

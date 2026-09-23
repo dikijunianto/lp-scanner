@@ -46,3 +46,5 @@ The adapter checks each record’s DEX relationship and token addresses. Pair pr
 The provider’s USD price-change percentages do not describe quote-token pair returns. Changes are computed from our own consistent pair-price history instead. OHLCV requests specify `currency=token&token=base`, matching quote-per-base prices. Candle timestamps are converted from seconds to milliseconds, sorted, validated, and incomplete candles excluded.
 
 Provider services and response schemas may change. Live API availability is not a guarantee; tests use clearly marked synthetic fixtures.
+
+Sprint 2 adds on-chain active-liquidity enrichment after discovery; see [methodology, price provenance and verification](active-liquidity.md).

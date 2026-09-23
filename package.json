@@ -33,8 +33,13 @@
     "vitest": "^5.0.1"
   },
   "dependencies": {
+    "@coral-xyz/anchor": "0.31.0",
+    "@ethersproject/abi": "5.8.0",
     "@fastify/rate-limit": "^11.2.0",
+    "@meteora-ag/dlmm": "^1.9.14",
+    "@solana/web3.js": "^1.99.0",
     "better-sqlite3": "^13.0.3",
+    "decimal.js": "^10.6.0",
     "dotenv": "^18.0.1",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.12.5",

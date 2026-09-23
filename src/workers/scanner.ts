@@ -1,3 +1,4 @@
+import { enrichLiquidity } from "../adapters/enrich-liquidity";
 import { eq } from "drizzle-orm";
 import pino from "pino";
 import { env } from "../config/env";
@@ -44,6 +45,7 @@ export class Scanner {
       this.adapters.map(async (adapter): Promise<SourceStatus> => {
         try {
           const { pools, notes } = await adapter.scan();
+          notes.push(await enrichLiquidity(pools));
           const items = pools.map((pool) =>
             snapshot(
               pool,

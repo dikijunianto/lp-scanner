@@ -70,11 +70,11 @@ Official documentation and live responses were inspected before implementation o
 
 | Source                           | Default behavior                                                                                       | Data limits                                                                                                                                     |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Meteora Data API                 | Paginated `/pools`, TVL ≥ $10,000, up to 1,000 pools sorted by TVL                                     | Fees, volume, metadata, dynamic fee rate, bin step and creation time. No active-liquidity USD field. Optional windows remain null when omitted. |
-| GeckoTerminal Base Uniswap V3    | First page of up to 20 protocol-specific pools                                                         | Pair price, TVL, volume, swap counts and pool age. Fees and active liquidity remain null.                                                       |
+| Meteora Data API                 | Paginated `/pools`, TVL ≥ $10,000, up to 1,000 pools sorted by TVL                                     | Fees, volume, metadata, dynamic fee rate, bin step and creation time. Active-bin USD enrichment for the first 40 pools via official SDK account decoding. Optional windows remain null when omitted. |
+| GeckoTerminal Base Uniswap V3    | First page of up to 20 protocol-specific pools                                                         | Pair price, TVL, volume, swap counts and pool age. Fees remain null; on-chain V3 virtual-reserve USD estimates enrich the first 20 pools.                                                       |
 | GeckoTerminal BSC PancakeSwap V3 | First page of up to 20 protocol-specific pools                                                         | Same restrictions. No paid key required.                                                                                                        |
 | Optional protocol V3 subgraph    | Preferred if a URL is configured; falls back to public discovery on failure                            | Hourly fees and volume only when every expected completed UTC hour is present. Provider/indexer fees are not a personalized LP payout.          |
-| Optional Base/BSC RPC            | Checks chain ID, then `eth_call` for fee rate and tick spacing on a bounded number of discovered pools | No transactions, signing, or wallet interaction. Discovery does not need RPC.                                                                   |
+| Optional Base/BSC RPC            | Checks chain ID and block freshness, then Multicall reads current V3 state and token decimals | No transactions, signing, or wallet interaction. Discovery does not need RPC.                                                                   |
 
 Default discovery is deliberately bounded, and the source-health panel reports caps. Set `METEORA_MAX_POOLS=0` to scan all pools matching `METEORA_MIN_TVL`; set `METEORA_MIN_TVL=0` to include low-liquidity pools. Blacklisted Meteora pools are excluded by discovery. `EVM_PAGES` accepts 1–10 pages (20 pools/page). Pagination while markets change can shift pool membership; Meteora results are deduplicated.
 
@@ -82,10 +82,12 @@ Historical OHLCV is fetched on opening a pool detail, cached for five minutes an
 
 Public APIs can be delayed, incomplete or unavailable. Observation timestamps mean when this scanner received data, not a certified block timestamp. Failed sources keep their last observation, visibly marked stale after three scan intervals. A source failure does not prevent other adapters from writing snapshots.
 
+Sprint 2 adds active-liquidity provenance to each row and pool detail, plus a **Reliable active liquidity** filter (fresh HIGH/MEDIUM; V3 estimates remain labeled). Source publication times for current indexer USD prices are unknown, so present results are MEDIUM, never HIGH.
+
 ## Metric definitions
 
 - **TVL:** total USD liquidity reported by the provider, including inactive liquidity.
-- **Active liquidity:** USD capital active at the current price/bin. Neither current public feed provides a defensible normalized USD value. It remains null. Raw V3 `liquidity` is not a USD quantity and is never used as one. Obtaining this correctly is the main next integration improvement.
+- **Active liquidity:** actual active-bin token balances valued in USD for DLMM; an explicitly labeled virtual-reserve depth estimate for V3. Provenance, confidence, block/slot, token amounts, decimals and prices are stored. See [Sprint 2 methodology](docs/active-liquidity.md). These protocol denominators are not equivalent deposited capital.
 - **Fee efficiency:** `fees / activeLiquidityUsd`, shown as a percentage for 1h and 24h. Null if either input is missing or denominator is zero. Pool-wide fees against current active capital would still be an approximation, not individual-position yield.
 - **Capital turnover:** `volume / activeLiquidityUsd`. Separate from `volume24h / tvlUsd`, which is TVL turnover.
 - **Fee / volume acceleration:** current hourly amount divided by the 24h average hourly amount. `3×` means three times that average, not +300%. A zero baseline produces null, not infinity.
@@ -147,7 +149,7 @@ See [.env.example](.env.example) for every option. Values are validated at start
 - `METEORA_REQUESTS_PER_SECOND`: default 5, below Meteora’s documented 30 RPS.
 - `GECKO_REQUESTS_PER_MINUTE`: default 20, shared by both EVM adapters and candle requests in one process.
 - `BASE_SUBGRAPH_URL`, `BSC_SUBGRAPH_URL`: optional chain-correct V3 GraphQL endpoints. The Graph typically uses an API key in the URL and provider usage limits apply. No hardcoded key or paid subscription is required for the basic scanner.
-- `BASE_RPC_URL`, `BSC_RPC_URL`: optional read-only RPC providers; free or private URLs both work. `RPC_ENRICH_LIMIT` bounds extra requests.
+- `BASE_RPC_URL`, `BSC_RPC_URL`: read-only RPC overrides; empty values use public defaults. `SOLANA_RPC_URL` likewise overrides Solana mainnet RPC. Enrichment caps use `ACTIVE_LIQUIDITY_METEORA_LIMIT` (40) and `ACTIVE_LIQUIDITY_EVM_LIMIT` (20 per chain); zero disables that enrichment. `ACTIVE_LIQUIDITY_ENABLED=false` disables all enrichment.
 - `HTTP_TIMEOUT_MS`, `HTTP_RETRIES`, `LOG_LEVEL`: default 15s, 2 retries, info. Retry transient failures with exponential backoff; respect bounded Retry-After values. Schema errors and permanent client errors do not retry.
 - Alert thresholds and cooldown are environment-configured. No settings-write API is exposed.
 
@@ -185,7 +187,7 @@ Back up SQLite after stopping the app; copy the whole `data` directory, includin
 ## Reliability and troubleshooting
 
 - **Empty first screen:** wait for the first scan; inspect the source-health panel and `/api/health`. No fake production rows exist.
-- **Missing fees or efficiency:** public EVM feeds do not expose fees; active liquidity USD is unavailable for all default feeds. This is expected, not a zero yield estimate.
+- **Missing fees or efficiency:** public EVM feeds do not expose fees. Liquidity is unavailable outside the enrichment budget or when state/prices fail validation. Missing, stale or zero active liquidity gives null efficiency and turnover; total TVL is never substituted.
 - **No surge:** at least 30 minutes of suitable own-pool history is needed; a quiet-surge classification needs 4h price history. 24h changes need a day.
 - **No volatility/range result:** open pool details to fetch candles. Gaps and insufficient history deliberately produce unknown values.
 - **Partial source:** source fields or optional enrichments are unavailable. Other protocols continue. Old rows remain with their observation timestamp.
@@ -199,7 +201,7 @@ Graceful SIGINT/SIGTERM handling stops scheduling, waits for current requests/wo
 
 ## Current limitations and next work
 
-1. Obtain defensible active-bin/tick USD liquidity with explicit price provenance. Until then, capital-efficiency fields stay null.
+1. Add timestamped independent USD prices and complete V3 fee windows. Extend V3 depth to bounded tick ranges for cross-protocol comparisons; virtual reserves are not deposited capital.
 2. Add optional token-risk sources for token creation time, authorities, concentration, transfer restrictions and verified contract source. Current coverage is intentionally incomplete.
 3. Add a budgeted background OHLCV crawl and verified source timestamps. At present candles are fetched on detail views and stored.
 4. Validate optional subgraph/RPC integrations against user-selected providers; default public feeds are the live path verified locally. Add pool discovery beyond capped ranked pages where needed.

@@ -6,6 +6,8 @@ const address = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
 const token = z.object({
   address,
   symbol: z.string().max(100).default("?"),
+  price: optionalPositive,
+  decimals: z.number().int().min(0).max(255).nullish(),
   is_verified: z.boolean().nullish(),
   freeze_authority_disabled: z.boolean().nullish(),
 });
@@ -28,6 +30,10 @@ export function normalizeMeteora(raw: unknown, now = Date.now()): Pool {
   const data = meteoraSchema.parse(raw);
   const token0 = {
     ...emptyToken(data.token_x.address, data.token_x.symbol),
+    decimals: data.token_x.decimals ?? null,
+    usdPrice: data.token_x.price,
+    usdPriceObservedAt: data.token_x.price ? now : null,
+    usdPriceSource: "Meteora Data API",
     verified: data.token_x.is_verified ?? null,
     freezeAuthority:
       data.token_x.freeze_authority_disabled == null
@@ -36,6 +42,10 @@ export function normalizeMeteora(raw: unknown, now = Date.now()): Pool {
   };
   const token1 = {
     ...emptyToken(data.token_y.address, data.token_y.symbol),
+    decimals: data.token_y.decimals ?? null,
+    usdPrice: data.token_y.price,
+    usdPriceObservedAt: data.token_y.price ? now : null,
+    usdPriceSource: "Meteora Data API",
     verified: data.token_y.is_verified ?? null,
     freezeAuthority:
       data.token_y.freeze_authority_disabled == null
@@ -110,7 +120,9 @@ export class MeteoraAdapter implements Adapter {
       notes.push(
         `Coverage: ${pools.length} of ${total} matching pools (configured cap ${env.METEORA_MAX_POOLS || "none"})`,
       );
-    notes.push(`TVL filter ≥ $${env.METEORA_MIN_TVL}; active liquidity unavailable from this API`);
+    notes.push(
+      `TVL filter ≥ $${env.METEORA_MIN_TVL}; active-bin liquidity enriched separately through RPC`,
+    );
     if (!pools.length && total > 0) throw new Error("Upstream response failed validation");
     return { pools: [...new Map(pools.map((p) => [p.id, p])).values()], notes };
   }

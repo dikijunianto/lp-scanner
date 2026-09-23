@@ -1,4 +1,6 @@
 "use client";
+import { expireLiquidity } from "@/core/analytics";
+import { LiquidityProvenance } from "./liquidity";
 import Link from "next/link";
 import {
   LineChart,
@@ -34,7 +36,7 @@ export function PoolDetail({ id }: { id: string }) {
         <button onClick={refresh}>Retry</button> <Link href="/">Back to scanner</Link>
       </div>
     );
-  const { pool: p, metrics: m, history, candles, ranges } = data;
+  const { pool: p, metrics: m, history, candles, ranges } = expireLiquidity(data, observedAt);
   return (
     <>
       <Link className="back" href="/">
@@ -77,6 +79,7 @@ export function PoolDetail({ id }: { id: string }) {
         <Metric label="FEE EFFICIENCY 1H" value={efficiency(m.feeEfficiency1h)} />
         <Metric label="CAPITAL TURNOVER 1H" value={multiple(m.capitalTurnover1h)} />
       </section>
+      <LiquidityProvenance pool={p} now={observedAt} />
       <section className="bottom-grid">
         <div className="panel">
           <div className="score-heading">
