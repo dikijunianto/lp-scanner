@@ -3,6 +3,7 @@ export default defineConfig({
   test: {
     environment: "node",
     env: {
+      ACTIVE_LIQUIDITY_ENABLED: "false",
       TELEGRAM_BOT_TOKEN: "",
       TELEGRAM_CHAT_ID: "",
       BASE_SUBGRAPH_URL: "",

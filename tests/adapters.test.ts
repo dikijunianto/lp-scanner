@@ -83,7 +83,7 @@ describe("adapters", () => {
     const a = new UniswapV3Adapter(new HttpClient(0, fetcher));
     const result = await a.scan();
     expect(result.pools).toHaveLength(1);
-    expect(result.notes.join(" ")).toContain("fees, active liquidity");
+    expect(result.notes.join(" ")).toContain("fees and unique traders");
   });
   it("reports missing upstreams without leaking a URL or token", async () => {
     const fetcher = vi.fn().mockRejectedValue(new Error("https://secret-key.example"));

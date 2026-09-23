@@ -1,3 +1,4 @@
+import { reliableLiquidity } from "./liquidity";
 import {
   type Pool,
   type Metrics,
@@ -67,10 +68,11 @@ export function analyze(
       h.token1Address === pool.token1Address &&
       h.source === pool.source,
   );
-  const feeEfficiency1h = ratio(pool.fees1h, pool.activeLiquidityUsd),
-    feeEfficiency24h = ratio(pool.fees24h, pool.activeLiquidityUsd);
-  const capitalTurnover1h = ratio(pool.volume1h, pool.activeLiquidityUsd),
-    capitalTurnover24h = ratio(pool.volume24h, pool.activeLiquidityUsd);
+  const activeLiquidity = reliableLiquidity(pool, pool.timestamp) ? pool.activeLiquidityUsd : null;
+  const feeEfficiency1h = ratio(pool.fees1h, activeLiquidity),
+    feeEfficiency24h = ratio(pool.fees24h, activeLiquidity);
+  const capitalTurnover1h = ratio(pool.volume1h, activeLiquidity),
+    capitalTurnover24h = ratio(pool.volume24h, activeLiquidity);
   const feeAcceleration = ratio(pool.fees1h, pool.fees24h === null ? null : pool.fees24h / 24);
   const volumeAcceleration = ratio(
     pool.volume1h,
@@ -85,7 +87,12 @@ export function analyze(
     volumeSurge = old ? ratio(pool.volume1h, old.volume1h) : null;
   const swapAcceleration = old ? ratio(pool.swapCount, old.swapCount) : null;
   const tvlChange30m = old ? change(pool.tvlUsd, old.tvlUsd) : null,
-    activeLiquidityChange30m = old ? change(pool.activeLiquidityUsd, old.activeLiquidityUsd) : null;
+    activeLiquidityChange30m =
+      old &&
+      reliableLiquidity(old, old.timestamp) &&
+      old.activeLiquidityDetails?.method === pool.activeLiquidityDetails?.method
+        ? change(activeLiquidity, old.activeLiquidityUsd)
+        : null;
   const changes = [pool.priceChange30m, pool.priceChange1h, pool.priceChange4h];
   let trend: Metrics["trend"] = "UNKNOWN";
   if (changes.every((v) => v !== null)) {
@@ -214,9 +221,15 @@ export function analyze(
     riskReasons.push(
       "Transfer restrictions, buy/sell taxes and verified contract source are not checked",
     );
-  if (pool.activeLiquidityUsd === null)
+  if (activeLiquidity === null)
     riskReasons.push(
       "Active liquidity unavailable; capital efficiency and price impact cannot be assessed",
+    );
+  if (activeLiquidity !== null)
+    riskReasons.push(
+      pool.activeLiquiditySource === "ESTIMATED"
+        ? "Active liquidity is a virtual-reserve depth estimate, not deposited capital. Fee and turnover ratios are not yields and are not directly comparable to DLMM active-bin ratios."
+        : "Pool-wide historical fees and volume are divided by current active-bin capital; bins and active liquidity change over time. Ratios are not position returns.",
     );
   let activityPattern = "INSUFFICIENT HISTORY";
   if (surge) activityPattern = "FRESH ACTIVITY SURGE";
@@ -341,4 +354,40 @@ export function simulateRanges(price: Nullable, candles: Candle[]) {
       relativeConcentration: 2 / (2 - Math.sqrt(1 - width) - 1 / Math.sqrt(1 + width)),
     };
   });
+}
+
+// Expire the read view only; persisted snapshots remain valid historical observations.
+export function expireLiquidity<T extends Snapshot>(data: T, now: number): T {
+  if (data.pool.activeLiquidityUsd === null || reliableLiquidity(data.pool, now)) return data;
+  const pool = {
+    ...data.pool,
+    activeLiquidityUsd: null,
+    activeLiquidityConfidence: "UNAVAILABLE" as const,
+    activeLiquidityReason: "Stale or unverified liquidity observation",
+  };
+  const withoutLiquidity = analyze(pool, []);
+  return {
+    ...data,
+    pool,
+    metrics: {
+      ...data.metrics,
+      feeEfficiency1h: null,
+      feeEfficiency24h: null,
+      capitalTurnover1h: null,
+      capitalTurnover24h: null,
+      activeLiquidityChange30m: null,
+      activity: withoutLiquidity.activity,
+      activityCoverage: withoutLiquidity.activityCoverage,
+      activityReasons: data.metrics.activityReasons.filter(
+        (reason) =>
+          !reason.startsWith("Fee / active liquidity") &&
+          !reason.startsWith("Volume / active liquidity"),
+      ),
+      // Preserve historical risk and surge evidence; expiry does not erase those observations.
+      riskReasons: [
+        ...data.metrics.riskReasons,
+        "Active liquidity expired; current capital ratios are unavailable",
+      ],
+    },
+  };
 }

@@ -19,7 +19,16 @@ const schema = z.object({
   BSC_SUBGRAPH_URL: optionalUrl,
   BASE_RPC_URL: optionalUrl,
   BSC_RPC_URL: optionalUrl,
-  RPC_ENRICH_LIMIT: integer(5, 0, 100),
+  SOLANA_RPC_URL: optionalUrl,
+  ACTIVE_LIQUIDITY_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  ACTIVE_LIQUIDITY_METEORA_LIMIT: integer(40, 0, 1000),
+  ACTIVE_LIQUIDITY_EVM_LIMIT: integer(20, 0, 200),
+  ACTIVE_LIQUIDITY_MAX_AGE_SECONDS: integer(120, 30, 600),
+  ACTIVE_LIQUIDITY_PRICE_MAX_AGE_SECONDS: integer(180, 30, 600),
+  ACTIVE_LIQUIDITY_MAX_PRICE_DIVERGENCE: z.coerce.number().min(0.001).max(0.5).default(0.1),
   HTTP_TIMEOUT_MS: integer(15000, 100, 120000),
   HTTP_RETRIES: integer(2, 0, 5),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),

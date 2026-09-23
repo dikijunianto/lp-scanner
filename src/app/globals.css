@@ -735,3 +735,18 @@ footer a {
     font-size: 10px;
   }
 }
+
+.liquidity-provenance {
+  display: block;
+  font-size: 8px;
+  color: var(--muted);
+  letter-spacing: 0.3px;
+  margin-top: 4px;
+}
+.panel h2 .liquidity-provenance {
+  font-size: 11px;
+}
+.workspace-top {
+  gap: 14px;
+  flex-wrap: wrap;
+}
