@@ -60,9 +60,10 @@ export function LiquidityProvenance({ pool, now }: { pool: Pool; now: number }) 
             <dd>
               {usd(d.price0Usd)} / {usd(d.price1Usd)} · {d.priceSource}
             </dd>
-            <dt>Price fetched</dt>
+            <dt>Price observed</dt>
             <dd>
-              {new Date(d.priceObservedAt).toLocaleString()} · provider publication time unknown
+              {new Date(d.priceObservedAt).toLocaleString()} · publication times are listed in
+              Economic Data Quality
             </dd>
           </dl>
           <p>

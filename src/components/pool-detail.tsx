@@ -80,6 +80,95 @@ export function PoolDetail({ id }: { id: string }) {
         <Metric label="CAPITAL TURNOVER 1H" value={multiple(m.capitalTurnover1h)} />
       </section>
       <LiquidityProvenance pool={p} now={observedAt} />
+      <section className="panel">
+        <div className="eyebrow">ECONOMIC DATA QUALITY</div>
+        <div className="facts">
+          <Metric label="DATA CONFIDENCE" value={m.dataQuality ?? "UNAVAILABLE"} />
+          <Metric label="PRICE CONFIDENCE" value={m.priceConfidence ?? "UNAVAILABLE"} />
+          <Metric label="LIQUIDITY CONFIDENCE" value={m.liquidityConfidence ?? "UNAVAILABLE"} />
+          <Metric label="FEE CONFIDENCE" value={m.feeConfidence ?? "UNAVAILABLE"} />
+        </div>
+        {[p.token0, p.token1].map((token) => (
+          <p key={token.address} className="muted">
+            {token.symbol}: {usd(token.usdPrice)} ·{" "}
+            {token.usdPriceSource ?? "Price source unavailable"} · publication{" "}
+            {token.usdPriceSourceTimestamp
+              ? new Date(token.usdPriceSourceTimestamp).toLocaleString()
+              : "unknown"}{" "}
+            · observed{" "}
+            {token.usdPriceObservedAt
+              ? new Date(token.usdPriceObservedAt).toLocaleString()
+              : "unknown"}{" "}
+            · confidence {token.usdPriceConfidence ?? "UNAVAILABLE"}
+          </p>
+        ))}
+      </section>
+      <section className="panel">
+        <div className="eyebrow">BOUNDED LIQUIDITY DEPTH</div>
+        <div className="facts">
+          <Metric label="DEPTH ±1%" value={usd(p.depth1PctUsd ?? null)} />
+          <Metric label="DEPTH ±2.5%" value={usd(p.depth2_5PctUsd ?? null)} />
+          <Metric label="DEPTH ±5%" value={usd(p.depth5PctUsd ?? null)} />
+          <Metric label="DEPTH ±10%" value={usd(p.depth10PctUsd ?? null)} />
+          <Metric
+            label="ACTIVE LIQUIDITY EFFICIENCY 1H / 24H"
+            value={`${efficiency(m.feeEfficiency1h)} / ${efficiency(m.feeEfficiency24h)}`}
+          />
+          <Metric
+            label="BOUNDED ±5% DEPTH EFFICIENCY 1H / 24H"
+            value={`${efficiency(m.feeEfficiencyDepth1h ?? null)} / ${efficiency(m.feeEfficiencyDepth24h ?? null)}`}
+          />
+          <Metric
+            label="VOLUME / ±5% DEPTH 1H / 24H"
+            value={`${multiple(m.volumeDepthRatio1h ?? null)} / ${multiple(m.volumeDepthRatio24h ?? null)}`}
+          />
+        </div>
+        <p className="muted">
+          {p.depthSource ?? "Depth unavailable"} · {p.depthConfidence ?? "UNAVAILABLE"} ·
+          {p.depthUpdatedAt
+            ? ` ${new Date(p.depthUpdatedAt).toLocaleString()}`
+            : " no completed observation"}
+          . Depth measures nearby actual bins or directional V3 inventory, not total TVL.
+        </p>
+      </section>
+      <section className="panel">
+        <div className="eyebrow">MEASURED FEE WINDOWS</div>
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>WINDOW</th>
+                <th>VOLUME</th>
+                <th>FEES</th>
+                <th>SOURCE</th>
+                <th>CONFIDENCE</th>
+                <th>THROUGH</th>
+              </tr>
+            </thead>
+            <tbody>
+              {windows.map((window) => {
+                const fee = p.feeWindows?.[window];
+                return (
+                  <tr key={window}>
+                    <td>{window}</td>
+                    <td>{usd(fee?.volumeUsd ?? null)}</td>
+                    <td>{usd(fee?.feesUsd ?? null)}</td>
+                    <td>{fee?.methodology ?? "UNAVAILABLE"}</td>
+                    <td>{fee?.confidence ?? "UNAVAILABLE"}</td>
+                    <td>{fee ? new Date(fee.windowEnd).toLocaleTimeString() : "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted">
+          EVM fees use swap input volume × immutable pool fee tier. PancakeSwap subtracts the
+          protocol fee emitted in each swap; Uniswap reports gross pool fees because its Swap event
+          omits the historical protocol share. Windows remain unavailable until contiguous confirmed
+          blocks and USD prices cover them.
+        </p>
+      </section>
       <section className="bottom-grid">
         <div className="panel">
           <div className="score-heading">

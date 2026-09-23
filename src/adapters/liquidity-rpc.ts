@@ -13,6 +13,7 @@ export class ReadOnlyRpc {
       "eth_chainId",
       "eth_getBlockByNumber",
       "eth_call",
+      "eth_getLogs",
       "getGenesisHash",
       "getMultipleAccounts",
       "getBlockTime",

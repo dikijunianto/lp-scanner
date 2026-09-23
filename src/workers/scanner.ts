@@ -45,7 +45,49 @@ export class Scanner {
       this.adapters.map(async (adapter): Promise<SourceStatus> => {
         try {
           const { pools, notes } = await adapter.scan();
+          if (env.ACTIVE_LIQUIDITY_ENABLED && pools.length) {
+            const { enrichPrices } = await import("../adapters/pricing");
+            const priced = await enrichPrices(pools);
+            this.store.savePrices(priced.records);
+            notes.push(priced.note);
+          }
           notes.push(await enrichLiquidity(pools));
+          if (env.ACTIVE_LIQUIDITY_ENABLED && pools.length) {
+            try {
+              const { ReadOnlyRpc } = await import("../adapters/liquidity-rpc");
+              if (pools[0].chain === "solana") {
+                const { enrichMeteoraDepth } = await import("../adapters/meteora-depth");
+                const { SOLANA_PUBLIC_RPC } = await import("../adapters/meteora-liquidity");
+                notes.push(
+                  await enrichMeteoraDepth(
+                    pools,
+                    new ReadOnlyRpc(env.SOLANA_RPC_URL ?? SOLANA_PUBLIC_RPC),
+                    this.store,
+                  ),
+                );
+              } else if (pools[0].chain === "base" || pools[0].chain === "bsc") {
+                const chain = pools[0].chain;
+                const { evmNetworks } = await import("../adapters/evm-liquidity");
+                const rpc = new ReadOnlyRpc(
+                  (chain === "base" ? env.BASE_RPC_URL : env.BSC_RPC_URL) ?? evmNetworks[chain].url,
+                );
+                const { enrichEvmFees } = await import("../adapters/evm-fees");
+                const { enrichEvmDepth } = await import("../adapters/evm-depth");
+                const feeRpc =
+                  chain === "bsc"
+                    ? new ReadOnlyRpc(env.BSC_FEE_RPC_URL ?? "https://bsc-rpc.publicnode.com")
+                    : rpc;
+                const depthRpc =
+                  chain === "base"
+                    ? new ReadOnlyRpc(env.BASE_DEPTH_RPC_URL ?? "https://base-rpc.publicnode.com")
+                    : rpc;
+                notes.push(await enrichEvmFees(pools, feeRpc, this.store));
+                notes.push(await enrichEvmDepth(pools, depthRpc, this.store));
+              }
+            } catch {
+              notes.push("Economic enrichment unavailable");
+            }
+          }
           const items = pools.map((pool) =>
             snapshot(
               pool,

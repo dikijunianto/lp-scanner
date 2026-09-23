@@ -94,6 +94,10 @@ export function Dashboard() {
         return s.metrics.feeEfficiency1h;
       case "fee24h":
         return s.metrics.feeEfficiency24h;
+      case "feeDepth":
+        return s.metrics.feeEfficiencyDepth1h ?? null;
+      case "volumeDepth":
+        return s.metrics.volumeDepthRatio1h ?? null;
       case "turnover":
         return s.metrics.capitalTurnover1h;
       case "volume":
@@ -243,6 +247,8 @@ export function Dashboard() {
                 ["risk", "Risk score ↑"],
                 ["fee1h", "Fee efficiency 1h ↓"],
                 ["fee24h", "Fee efficiency 24h ↓"],
+                ["feeDepth", "Fees / ±5% depth ↓"],
+                ["volumeDepth", "Volume / ±5% depth ↓"],
                 ["turnover", "Volume / active liq ↓"],
                 ["volume", "Volume acceleration ↓"],
                 ["fees", "Fee acceleration ↓"],
@@ -336,6 +342,7 @@ export function Dashboard() {
                   </td>
                   <td>
                     <Score value={m.activity} coverage={m.activityCoverage} />
+                    <small>Confidence: {m.dataQuality ?? "UNAVAILABLE"}</small>
                   </td>
                   <td>
                     <Score value={m.risk} coverage={m.riskCoverage} risk />

@@ -9,6 +9,28 @@ export const windowMs: Record<Window, number> = {
   "24h": 86400000,
 };
 export type Nullable = number | null;
+export type Confidence = "HIGH" | "MEDIUM" | "LOW" | "UNAVAILABLE";
+export interface PriceRecord {
+  assetAddress: string;
+  chain: string;
+  symbol: string;
+  priceUsd: number;
+  source: string;
+  sourceTimestamp: number | null;
+  observedAt: number;
+  blockNumber: string | null;
+  confidence: Confidence;
+}
+export interface FeeWindow {
+  volumeUsd: Nullable;
+  feesUsd: Nullable;
+  windowStart: number;
+  windowEnd: number;
+  startBlock: number | null;
+  endBlock: number | null;
+  methodology: "EVENT_DERIVED" | "INDEXER_DERIVED" | "APPROXIMATED" | "UNAVAILABLE";
+  confidence: Confidence;
+}
 export interface Token {
   address: string;
   symbol: string;
@@ -16,6 +38,8 @@ export interface Token {
   usdPrice: Nullable;
   usdPriceObservedAt: Nullable;
   usdPriceSource: string | null;
+  usdPriceSourceTimestamp?: Nullable;
+  usdPriceConfidence?: Confidence;
   ageHours: Nullable;
   mintAuthority: boolean | null;
   freezeAuthority: boolean | null;
@@ -55,6 +79,18 @@ export type Pool = {
   timestamp: number;
   source: string;
   warnings: string[];
+  priceConfidence?: Confidence;
+  dataQuality?: Confidence;
+  feeConfidence?: Confidence;
+  feeWindows?: Partial<Record<Window, FeeWindow>>;
+  depth1PctUsd?: Nullable;
+  depth2_5PctUsd?: Nullable;
+  depth5PctUsd?: Nullable;
+  depth10PctUsd?: Nullable;
+  depthConfidence?: Confidence;
+  depthSource?: string | null;
+  depthUpdatedAt?: Nullable;
+  depthExpiresAt?: Nullable;
 } & Record<`volume${Window}` | `fees${Window}` | `priceChange${Window}`, Nullable>;
 export interface Candle {
   timestamp: number;
@@ -86,6 +122,14 @@ export interface Metrics {
   activityReasons: string[];
   riskReasons: string[];
   badges: string[];
+  feeEfficiencyDepth1h?: Nullable;
+  feeEfficiencyDepth24h?: Nullable;
+  volumeDepthRatio1h?: Nullable;
+  volumeDepthRatio24h?: Nullable;
+  dataQuality?: Confidence;
+  priceConfidence?: Confidence;
+  liquidityConfidence?: Confidence;
+  feeConfidence?: Confidence;
 }
 export interface Snapshot {
   pool: Pool;
@@ -125,6 +169,18 @@ export function emptyPool(
     tickSpacing: null,
     timestamp: now,
     warnings: [],
+    priceConfidence: "UNAVAILABLE",
+    dataQuality: "UNAVAILABLE",
+    feeConfidence: "UNAVAILABLE",
+    feeWindows: {},
+    depth1PctUsd: null,
+    depth2_5PctUsd: null,
+    depth5PctUsd: null,
+    depth10PctUsd: null,
+    depthConfidence: "UNAVAILABLE",
+    depthSource: null,
+    depthUpdatedAt: null,
+    depthExpiresAt: null,
   };
 }
 export const emptyToken = (address: string, symbol: string): Token => ({
@@ -134,6 +190,8 @@ export const emptyToken = (address: string, symbol: string): Token => ({
   usdPrice: null,
   usdPriceObservedAt: null,
   usdPriceSource: null,
+  usdPriceSourceTimestamp: null,
+  usdPriceConfidence: "UNAVAILABLE",
   ageHours: null,
   mintAuthority: null,
   freezeAuthority: null,

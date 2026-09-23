@@ -1,4 +1,5 @@
 import { reliableLiquidity } from "./liquidity";
+import { minConfidence } from "./pricing";
 import {
   type Pool,
   type Metrics,
@@ -69,6 +70,54 @@ export function analyze(
       h.source === pool.source,
   );
   const activeLiquidity = reliableLiquidity(pool, pool.timestamp) ? pool.activeLiquidityUsd : null;
+  const priceConfidence = minConfidence(
+    pool.token0.usdPriceConfidence ?? "UNAVAILABLE",
+    pool.token1.usdPriceConfidence ?? "UNAVAILABLE",
+  );
+  const liquidityConfidence =
+    activeLiquidity === null ? "UNAVAILABLE" : pool.activeLiquidityConfidence;
+  const feeConfidence =
+    pool.feeConfidence === "UNAVAILABLE" && pool.chain === "solana" && pool.fees1h !== null
+      ? "MEDIUM"
+      : (pool.feeConfidence ?? "UNAVAILABLE");
+  const depth5 =
+    pool.depth5PctUsd !== null &&
+    pool.depth5PctUsd !== undefined &&
+    ["HIGH", "MEDIUM"].includes(pool.depthConfidence ?? "UNAVAILABLE") &&
+    pool.depthExpiresAt != null &&
+    pool.timestamp <= pool.depthExpiresAt
+      ? pool.depth5PctUsd
+      : null;
+  const depthFees1h =
+    pool.chain === "solana"
+      ? pool.fees1h
+      : pool.feeWindows?.["1h"]?.methodology === "EVENT_DERIVED"
+        ? pool.feeWindows["1h"].feesUsd
+        : null;
+  const depthFees24h =
+    pool.chain === "solana"
+      ? pool.fees24h
+      : pool.feeWindows?.["24h"]?.methodology === "EVENT_DERIVED"
+        ? pool.feeWindows["24h"].feesUsd
+        : null;
+  const depthVolume1h =
+    pool.chain === "solana"
+      ? pool.volume1h
+      : pool.feeWindows?.["1h"]?.methodology === "EVENT_DERIVED"
+        ? pool.feeWindows["1h"].volumeUsd
+        : null;
+  const depthVolume24h =
+    pool.chain === "solana"
+      ? pool.volume24h
+      : pool.feeWindows?.["24h"]?.methodology === "EVENT_DERIVED"
+        ? pool.feeWindows["24h"].volumeUsd
+        : null;
+  const dataQuality = minConfidence(
+    priceConfidence,
+    liquidityConfidence,
+    feeConfidence,
+    depth5 === null ? "UNAVAILABLE" : (pool.depthConfidence ?? "UNAVAILABLE"),
+  );
   const feeEfficiency1h = ratio(pool.fees1h, activeLiquidity),
     feeEfficiency24h = ratio(pool.fees24h, activeLiquidity);
   const capitalTurnover1h = ratio(pool.volume1h, activeLiquidity),
@@ -262,6 +311,13 @@ export function analyze(
     activityReasons.push(
       `Hourly fees ${feeSurge!.toFixed(1)}× and volume ${volumeSurge!.toFixed(1)}× their rates 30m ago`,
     );
+  if (pool.warnings.includes("PRICE_STALE")) badges.push("PRICE STALE");
+  if (pool.warnings.includes("PRICE_DISAGREEMENT")) badges.push("PRICE DISAGREEMENT");
+  if (Object.values(pool.feeWindows ?? {}).some((v) => v?.methodology === "EVENT_DERIVED"))
+    badges.push("FEE MEASURED");
+  else if (Object.values(pool.feeWindows ?? {}).some((v) => v?.methodology === "APPROXIMATED"))
+    badges.push("FEE ESTIMATED");
+  if (dataQuality === "LOW" || dataQuality === "UNAVAILABLE") badges.push("LOW DATA CONFIDENCE");
   return {
     feeEfficiency1h,
     feeEfficiency24h,
@@ -284,6 +340,14 @@ export function analyze(
     activityReasons,
     riskReasons,
     badges,
+    feeEfficiencyDepth1h: ratio(depthFees1h, depth5),
+    feeEfficiencyDepth24h: ratio(depthFees24h, depth5),
+    volumeDepthRatio1h: ratio(depthVolume1h, depth5),
+    volumeDepthRatio24h: ratio(depthVolume24h, depth5),
+    dataQuality,
+    priceConfidence,
+    liquidityConfidence,
+    feeConfidence,
   };
 }
 export function snapshot(
@@ -293,7 +357,11 @@ export function snapshot(
   options?: { surgeMultiplier: number; minHourlyFees: number },
 ): Snapshot {
   const enriched = enrichHistory(pool, history, candles);
-  return { pool: enriched, metrics: analyze(enriched, history, options) };
+  const metrics = analyze(enriched, history, options);
+  enriched.priceConfidence = metrics.priceConfidence;
+  enriched.dataQuality = metrics.dataQuality;
+  enriched.feeConfidence = metrics.feeConfidence;
+  return { pool: enriched, metrics };
 }
 export function simulateRanges(price: Nullable, candles: Candle[]) {
   if (price === null || price <= 0 || candles.length < 2) return [];
@@ -358,36 +426,76 @@ export function simulateRanges(price: Nullable, candles: Candle[]) {
 
 // Expire the read view only; persisted snapshots remain valid historical observations.
 export function expireLiquidity<T extends Snapshot>(data: T, now: number): T {
-  if (data.pool.activeLiquidityUsd === null || reliableLiquidity(data.pool, now)) return data;
+  const depthExpired =
+    data.pool.depth5PctUsd != null &&
+    data.pool.depthExpiresAt != null &&
+    now > data.pool.depthExpiresAt;
+  const activeExpired = data.pool.activeLiquidityUsd !== null && !reliableLiquidity(data.pool, now);
+  if (!activeExpired && !depthExpired) return data;
   const pool = {
     ...data.pool,
-    activeLiquidityUsd: null,
-    activeLiquidityConfidence: "UNAVAILABLE" as const,
-    activeLiquidityReason: "Stale or unverified liquidity observation",
+    ...(activeExpired
+      ? {
+          activeLiquidityUsd: null,
+          activeLiquidityConfidence: "UNAVAILABLE" as const,
+          activeLiquidityReason: "Stale or unverified liquidity observation",
+        }
+      : {}),
+    ...(depthExpired
+      ? {
+          depth1PctUsd: null,
+          depth2_5PctUsd: null,
+          depth5PctUsd: null,
+          depth10PctUsd: null,
+          depthConfidence: "UNAVAILABLE" as const,
+        }
+      : {}),
   };
   const withoutLiquidity = analyze(pool, []);
+  pool.dataQuality = withoutLiquidity.dataQuality;
   return {
     ...data,
     pool,
     metrics: {
       ...data.metrics,
-      feeEfficiency1h: null,
-      feeEfficiency24h: null,
-      capitalTurnover1h: null,
-      capitalTurnover24h: null,
-      activeLiquidityChange30m: null,
-      activity: withoutLiquidity.activity,
-      activityCoverage: withoutLiquidity.activityCoverage,
-      activityReasons: data.metrics.activityReasons.filter(
-        (reason) =>
-          !reason.startsWith("Fee / active liquidity") &&
-          !reason.startsWith("Volume / active liquidity"),
-      ),
+      ...(activeExpired
+        ? {
+            feeEfficiency1h: null,
+            feeEfficiency24h: null,
+            capitalTurnover1h: null,
+            capitalTurnover24h: null,
+            activeLiquidityChange30m: null,
+          }
+        : {}),
+      feeEfficiencyDepth1h: depthExpired ? null : data.metrics.feeEfficiencyDepth1h,
+      feeEfficiencyDepth24h: depthExpired ? null : data.metrics.feeEfficiencyDepth24h,
+      volumeDepthRatio1h: depthExpired ? null : data.metrics.volumeDepthRatio1h,
+      volumeDepthRatio24h: depthExpired ? null : data.metrics.volumeDepthRatio24h,
+      dataQuality: withoutLiquidity.dataQuality,
+      liquidityConfidence: withoutLiquidity.liquidityConfidence,
+      badges:
+        withoutLiquidity.dataQuality === "UNAVAILABLE" &&
+        !data.metrics.badges.includes("LOW DATA CONFIDENCE")
+          ? [...data.metrics.badges, "LOW DATA CONFIDENCE"]
+          : data.metrics.badges,
+      activity: activeExpired ? withoutLiquidity.activity : data.metrics.activity,
+      activityCoverage: activeExpired
+        ? withoutLiquidity.activityCoverage
+        : data.metrics.activityCoverage,
+      activityReasons: activeExpired
+        ? data.metrics.activityReasons.filter(
+            (reason) =>
+              !reason.startsWith("Fee / active liquidity") &&
+              !reason.startsWith("Volume / active liquidity"),
+          )
+        : data.metrics.activityReasons,
       // Preserve historical risk and surge evidence; expiry does not erase those observations.
-      riskReasons: [
-        ...data.metrics.riskReasons,
-        "Active liquidity expired; current capital ratios are unavailable",
-      ],
+      riskReasons: activeExpired
+        ? [
+            ...data.metrics.riskReasons,
+            "Active liquidity expired; current capital ratios are unavailable",
+          ]
+        : data.metrics.riskReasons,
     },
   };
 }
