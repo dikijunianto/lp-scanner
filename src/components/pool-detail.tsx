@@ -16,6 +16,7 @@ import { windows } from "@/core/model";
 import type { simulateRanges } from "@/core/analytics";
 import { Score } from "./dashboard";
 import { useData } from "./use-data";
+import { WatchButton } from "./watch-button";
 import { age, usd, price, number, percent, efficiency, multiple } from "./format";
 interface DetailData extends Snapshot {
   history: Snapshot[];
@@ -48,6 +49,7 @@ export function PoolDetail({ id }: { id: string }) {
             {p.chain.toUpperCase()} / {p.dex.toUpperCase()}
           </div>
           <h1>{p.pair}</h1>
+          <WatchButton poolId={p.id} />
           <div className="badges">
             {m.badges.map((b) => (
               <span className="badge" key={b}>
@@ -100,6 +102,9 @@ export function PoolDetail({ id }: { id: string }) {
               ? new Date(token.usdPriceObservedAt).toLocaleString()
               : "unknown"}{" "}
             · confidence {token.usdPriceConfidence ?? "UNAVAILABLE"}
+            {token.priceSourceCount ? ` · ${token.priceSourceCount} independent source${token.priceSourceCount === 1 ? "" : "s"}` : ""}
+            {token.priceMaxDeviationPct != null ? ` · max deviation ${token.priceMaxDeviationPct.toFixed(2)}%` : ""}
+            {token.priceConsensusConfidence ? ` · consensus ${token.priceConsensusConfidence}` : ""}
           </p>
         ))}
       </section>

@@ -24,6 +24,10 @@ export interface PriceRecord {
 export interface FeeWindow {
   volumeUsd: Nullable;
   feesUsd: Nullable;
+  grossFeesUsd?: Nullable;
+  lpFeesUsd?: Nullable;
+  swapCount?: number | null;
+  uniqueTraderCount?: number | null;
   windowStart: number;
   windowEnd: number;
   startBlock: number | null;
@@ -40,6 +44,9 @@ export interface Token {
   usdPriceSource: string | null;
   usdPriceSourceTimestamp?: Nullable;
   usdPriceConfidence?: Confidence;
+  priceSourceCount?: number;
+  priceMaxDeviationPct?: Nullable;
+  priceConsensusConfidence?: Confidence;
   ageHours: Nullable;
   mintAuthority: boolean | null;
   freezeAuthority: boolean | null;
@@ -192,6 +199,9 @@ export const emptyToken = (address: string, symbol: string): Token => ({
   usdPriceSource: null,
   usdPriceSourceTimestamp: null,
   usdPriceConfidence: "UNAVAILABLE",
+  priceSourceCount: 0,
+  priceMaxDeviationPct: null,
+  priceConsensusConfidence: "UNAVAILABLE",
   ageHours: null,
   mintAuthority: null,
   freezeAuthority: null,

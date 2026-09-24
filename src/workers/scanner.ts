@@ -1,9 +1,11 @@
 import { enrichLiquidity } from "../adapters/enrich-liquidity";
 import { eq } from "drizzle-orm";
 import pino from "pino";
-import { env } from "../config/env";
+import { env, researchPolicy, priorityPolicy } from "../config/env";
+import { priorityScore } from "../core/research";
+import { withTraffic, type Traffic } from "../core/traffic";
 import { snapshot } from "../core/analytics";
-import type { Adapter } from "../core/model";
+import { windows, type Adapter } from "../core/model";
 import { MeteoraAdapter } from "../adapters/meteora";
 import { UniswapV3Adapter, PancakeV3Adapter } from "../adapters/evm";
 import { safeError } from "../adapters/http";
@@ -29,12 +31,13 @@ export class Scanner {
   }
   scan() {
     if (this.active) return this.active;
-    this.active = this.execute().finally(() => {
+    const traffic: Traffic = { apiRequests: 0, rpcRequests: 0, cacheHits: 0 };
+    this.active = withTraffic(traffic, () => this.execute(traffic)).finally(() => {
       this.active = null;
     });
     return this.active;
   }
-  private async execute() {
+  private async execute(traffic: Traffic) {
     const startedAt = Date.now();
     const id = this.store.db
       .insert(runs)
@@ -45,9 +48,11 @@ export class Scanner {
       this.adapters.map(async (adapter): Promise<SourceStatus> => {
         try {
           const { pools, notes } = await adapter.scan();
+          const watched = this.store.watchedIds();
+          pools.sort((a, b) => priorityScore(b, watched.has(b.id), undefined, priorityPolicy()) - priorityScore(a, watched.has(a.id), undefined, priorityPolicy()));
           if (env.ACTIVE_LIQUIDITY_ENABLED && pools.length) {
             const { enrichPrices } = await import("../adapters/pricing");
-            const priced = await enrichPrices(pools);
+            const priced = await enrichPrices(pools, this.store);
             this.store.savePrices(priced.records);
             notes.push(priced.note);
           }
@@ -63,26 +68,29 @@ export class Scanner {
                     pools,
                     new ReadOnlyRpc(env.SOLANA_RPC_URL ?? SOLANA_PUBLIC_RPC),
                     this.store,
+                    true,
+                    watched,
                   ),
                 );
               } else if (pools[0].chain === "base" || pools[0].chain === "bsc") {
                 const chain = pools[0].chain;
                 const { evmNetworks } = await import("../adapters/evm-liquidity");
-                const rpc = new ReadOnlyRpc(
-                  (chain === "base" ? env.BASE_RPC_URL : env.BSC_RPC_URL) ?? evmNetworks[chain].url,
-                );
-                const { enrichEvmFees } = await import("../adapters/evm-fees");
                 const { enrichEvmDepth } = await import("../adapters/evm-depth");
-                const feeRpc =
-                  chain === "bsc"
-                    ? new ReadOnlyRpc(env.BSC_FEE_RPC_URL ?? "https://bsc-rpc.publicnode.com")
-                    : rpc;
-                const depthRpc =
-                  chain === "base"
-                    ? new ReadOnlyRpc(env.BASE_DEPTH_RPC_URL ?? "https://base-rpc.publicnode.com")
-                    : rpc;
-                notes.push(await enrichEvmFees(pools, feeRpc, this.store));
-                notes.push(await enrichEvmDepth(pools, depthRpc, this.store));
+                const depthRpc = new ReadOnlyRpc((chain === "base" ? env.BASE_DEPTH_RPC_URL : env.BSC_RPC_URL) ?? evmNetworks[chain].url);
+                notes.push(await enrichEvmDepth(pools, depthRpc, this.store, true, watched));
+                for (const pool of pools) {
+                  const saved = this.store.latestFeeWindows(pool.id, pool.timestamp);
+                  pool.feeWindows = saved;
+                  for (const window of windows) {
+                    const data = saved[window];
+                    if (data?.methodology === "EVENT_DERIVED") {
+                      pool[`fees${window}`] = data.feesUsd;
+                      pool[`volume${window}`] = data.volumeUsd;
+                    }
+                  }
+                  pool.feeConfidence = saved["1h"]?.methodology === "EVENT_DERIVED" ? "MEDIUM"
+                    : saved["5m"]?.methodology === "EVENT_DERIVED" ? "LOW" : "UNAVAILABLE";
+                }
               }
             } catch {
               notes.push("Economic enrichment unavailable");
@@ -97,7 +105,13 @@ export class Scanner {
             ),
           );
           this.store.save(items);
-          for (const item of items) await recordAlert(this.store, item);
+          for (const item of items) {
+            const created = this.store.syncSignals(item, researchPolicy());
+            if (created.length) await recordAlert(this.store, item);
+          }
+          if (pools[0]?.chain === "base" || pools[0]?.chain === "bsc")
+            for (const item of items.slice(0, env.FEE_EVM_LIMIT))
+              this.store.enqueueBackfill(item.pool, priorityScore(item.pool, watched.has(item.pool.id), item.metrics, priorityPolicy()));
           return {
             name: adapter.name,
             status: notes.some((n) => n.includes("unavailable") || n.includes("skipped"))
@@ -127,6 +141,7 @@ export class Scanner {
       .where(eq(runs.id, id))
       .run();
     this.store.prune(env.RETENTION_DAYS);
+    this.store.saveScanMetrics(id, Date.now() - startedAt, traffic.apiRequests, traffic.rpcRequests, traffic.cacheHits);
     log.info(
       {
         run: id,

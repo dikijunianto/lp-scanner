@@ -49,6 +49,31 @@ export function comparePrices(a: number, b: number, policy: PricePolicy) {
   };
 }
 
+export function priceConsensus(
+  records: PriceRecord[],
+  highDeviationPct: number,
+  mediumDeviationPct: number,
+) {
+  const usable = records.filter(
+    (r) => r.sourceTimestamp !== null && (r.confidence === "HIGH" || r.confidence === "MEDIUM"),
+  );
+  if (!usable.length)
+    return { medianPrice: null, maxDeviationPct: null, sourceCount: 0, confidence: "UNAVAILABLE" as Confidence };
+  const values = usable.map((r) => r.priceUsd).sort((a, b) => a - b);
+  const middle = Math.floor(values.length / 2);
+  const medianPrice = values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+  const maxDeviationPct = Math.max(...values.map((p) => Math.abs(p / medianPrice - 1) * 100));
+  const sourceCount = new Set(usable.map((r) => r.source)).size;
+  const confidence: Confidence = maxDeviationPct > mediumDeviationPct
+    ? "UNAVAILABLE"
+    : sourceCount >= 2 && maxDeviationPct <= highDeviationPct && usable.every((r) => r.confidence === "HIGH")
+      ? "HIGH"
+      : maxDeviationPct <= mediumDeviationPct
+        ? "MEDIUM"
+        : "LOW";
+  return { medianPrice, maxDeviationPct, sourceCount, confidence };
+}
+
 const rank: Record<Confidence, number> = { UNAVAILABLE: 0, LOW: 1, MEDIUM: 2, HIGH: 3 };
 export function minConfidence(...values: Confidence[]): Confidence {
   return values.reduce((a, b) => (rank[a] <= rank[b] ? a : b), "HIGH");
@@ -58,7 +83,8 @@ export function applyPrice(token: Token, record: PriceRecord, pool: Pool, policy
   let confidence = record.confidence;
   if (token.usdPrice !== null && token.usdPriceSource !== record.source) {
     const compared = comparePrices(record.priceUsd, token.usdPrice, policy);
-    confidence = minConfidence(confidence, compared.confidence);
+    if (token.usdPriceSourceTimestamp != null)
+      confidence = minConfidence(confidence, compared.confidence);
     if (
       compared.disagreement !== null &&
       compared.disagreement >= policy.disagreement &&

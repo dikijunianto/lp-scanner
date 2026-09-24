@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import type { SignalPolicy, PriorityPolicy } from "../core/research";
 const integer = (fallback: number, min: number, max: number) =>
   z.coerce.number().int().min(min).max(max).default(fallback);
 const optionalUrl = z.preprocess((v) => (v === "" ? undefined : v), z.url().optional());
@@ -32,8 +33,10 @@ const schema = z.object({
   ACTIVE_LIQUIDITY_PRICE_MAX_AGE_SECONDS: integer(180, 30, 600),
   ACTIVE_LIQUIDITY_MAX_PRICE_DIVERGENCE: z.coerce.number().min(0.001).max(0.5).default(0.1),
   PRICE_API_URL: z.url().default("https://coins.llama.fi"),
-  PRICE_POOL_LIMIT: integer(40, 0, 1000),
-  PRICE_FALLBACK_LIMIT: integer(4, 0, 40),
+  PRICE_POOL_LIMIT: integer(1000, 0, 1000),
+  PRICE_FALLBACK_LIMIT: integer(20, 0, 100),
+  PRICE_CONSENSUS_HIGH_DEVIATION_PCT: z.coerce.number().min(0).max(100).default(1),
+  PRICE_CONSENSUS_MEDIUM_DEVIATION_PCT: z.coerce.number().min(0).max(100).default(15),
   PRICE_HIGH_AGE_SECONDS: integer(120, 1, 3600),
   PRICE_MEDIUM_AGE_SECONDS: integer(600, 1, 86400),
   PRICE_STABLECOIN_MEDIUM_AGE_SECONDS: integer(900, 1, 86400),
@@ -52,6 +55,21 @@ const schema = z.object({
   DEPTH_MAX_ARRAYS: integer(32, 1, 128),
   DEPTH_MAX_TICK_WORDS: integer(24, 1, 256),
   DEPTH_MAX_INITIALIZED_TICKS: integer(512, 1, 2048),
+  BACKGROUND_INTERVAL_SECONDS: integer(30, 5, 3600),
+  BACKFILL_POOLS_PER_CYCLE: integer(2, 1, 20),
+  BACKFILL_MAX_BLOCKS_PER_CYCLE: integer(300, 1, 10000),
+  BACKFILL_MAX_RETRIES: integer(5, 1, 100),
+  PRIORITY_TIER1_VOLUME_1H: z.coerce.number().nonnegative().default(50000),
+  PRIORITY_TIER2_VOLUME_1H: z.coerce.number().nonnegative().default(5000),
+  PRIORITY_TIER2_TVL: z.coerce.number().nonnegative().default(100000),
+  SIGNAL_FEE_EFFICIENCY: z.coerce.number().nonnegative().default(0.001),
+  SIGNAL_VOLUME_DEPTH: z.coerce.number().nonnegative().default(1),
+  SIGNAL_MIN_ACTIVITY: integer(70, 0, 100),
+  SIGNAL_MAX_RISK: integer(60, 0, 100),
+  SIGNAL_BREAKOUT_PCT: z.coerce.number().nonnegative().default(5),
+  SIGNAL_COLLAPSE_PCT: z.coerce.number().nonnegative().default(20),
+  ACTIVITY_PERSISTENCE_FRACTION: z.coerce.number().min(0).max(10).default(0.5),
+  OUTCOME_MAX_GAP_SECONDS: integer(240, 30, 3600),
   HTTP_TIMEOUT_MS: integer(15000, 100, 120000),
   HTTP_RETRIES: integer(2, 0, 5),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
@@ -71,3 +89,18 @@ if (!result.success)
     `Invalid environment: ${result.error.issues.map((i) => i.path.join(".")).join(", ")}`,
   );
 export const env = result.data;
+export const researchPolicy = (): SignalPolicy => ({
+  feeEfficiency: env.SIGNAL_FEE_EFFICIENCY,
+  volumeDepth: env.SIGNAL_VOLUME_DEPTH,
+  activity: env.SIGNAL_MIN_ACTIVITY,
+  risk: env.SIGNAL_MAX_RISK,
+  breakoutPct: env.SIGNAL_BREAKOUT_PCT,
+  collapsePct: env.SIGNAL_COLLAPSE_PCT,
+  persistenceFraction: env.ACTIVITY_PERSISTENCE_FRACTION,
+  maxObservationGapMs: env.OUTCOME_MAX_GAP_SECONDS * 1000,
+});
+export const priorityPolicy = (): PriorityPolicy => ({
+  tier1Volume1h: env.PRIORITY_TIER1_VOLUME_1H,
+  tier2Volume1h: env.PRIORITY_TIER2_VOLUME_1H,
+  tier2Tvl: env.PRIORITY_TIER2_TVL,
+});

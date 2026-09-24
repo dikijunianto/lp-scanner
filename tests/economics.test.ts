@@ -11,7 +11,7 @@ import {
   swapUsd,
 } from "../src/core/fees";
 import { createStore } from "../src/db/store";
-import { analyze } from "../src/core/analytics";
+import { analyze, snapshot } from "../src/core/analytics";
 
 const policy = {
   highAgeMs: 120000,
@@ -67,7 +67,7 @@ describe("timestamped independent pricing", () => {
       policy,
     );
     expect(p.token0.usdPrice).toBe(115);
-    expect(p.token0.usdPriceConfidence).toBe("LOW");
+    expect(p.token0.usdPriceConfidence).toBe("HIGH");
     expect(p.warnings).toContain("PRICE_DISAGREEMENT");
     expect(comparePrices(100, 140, policy).confidence).toBe("UNAVAILABLE");
     applyPrice(
@@ -219,6 +219,7 @@ describe("event fees and persistent cursor", () => {
   it("persists price history and removes unsafe fee history on reorg rollback", () => {
     const store = createStore(":memory:");
     try {
+      store.save([snapshot({...pool(),id:"p"},[])]);
       store.savePrices([
         {
           chain: "base",
