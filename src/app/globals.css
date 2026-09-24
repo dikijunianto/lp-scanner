@@ -750,3 +750,12 @@ footer a {
   gap: 14px;
   flex-wrap: wrap;
 }
+.top-links,.research-nav { display:flex; gap:18px; align-items:center; flex-wrap:wrap; color:var(--muted); font-size:12px; }
+.top-links a:hover,.research-nav a:hover { color:var(--green); }
+.research-nav { margin:20px 0; padding:12px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+.research-filters { display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); gap:14px; }
+.research-filters label { display:flex; flex-direction:column; gap:5px; color:var(--muted); font-size:10px; letter-spacing:.5px; }
+.research-filters input,.research-filters select { background:#172128; color:var(--text); border:1px solid var(--line); border-radius:5px; padding:8px; }
+.watch-button { background:transparent; color:var(--green); border:1px solid var(--line); border-radius:5px; padding:4px 8px; margin-left:8px; }
+.watch-button[aria-pressed="true"] { background:#254336; border-color:var(--green); }
+@media (max-width:700px) { .top-links { gap:7px; font-size:10px; } .topbar { height:auto; min-height:82px; flex-wrap:wrap; padding-top:12px; padding-bottom:12px; } }

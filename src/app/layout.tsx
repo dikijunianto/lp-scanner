@@ -16,6 +16,11 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               UNIFIED <b>LP SCANNER</b>
             </span>
           </Link>
+          <nav className="top-links" aria-label="Main navigation">
+            <Link href="/">Scanner</Link>
+            <Link href="/research/signals">Research</Link>
+            <Link href="/research/coverage">Data quality</Link>
+          </nav>
           <div className="readonly">
             <span className="dot" />
             READ-ONLY <span className="hide-small">/ NO WALLET REQUIRED</span>

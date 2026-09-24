@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { HttpClient } from "./http";
+import { countRpc } from "../core/traffic";
 export class ReadOnlyRpc {
   requests = 0;
   private id = 0;
@@ -26,6 +27,7 @@ export class ReadOnlyRpc {
         .slice(start, start + this.batchSize)
         .map((c) => ({ ...c, jsonrpc: "2.0", id: ++this.id }));
       this.requests++;
+      countRpc();
       const response = await this.http.json(
         this.url,
         z.array(

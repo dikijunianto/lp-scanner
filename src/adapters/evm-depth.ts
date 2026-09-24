@@ -21,7 +21,7 @@ export function applyDepth(pool: Pool, row: DepthRow) {
   pool.depthUpdatedAt = row.updatedAt;
   pool.depthExpiresAt = row.updatedAt + env.DEPTH_REFRESH_SECONDS * 2000;
 }
-export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Store) {
+export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Store, cacheOnly = false, watched = new Set<string>()) {
   const targets = pools
     .filter(
       (p) =>
@@ -42,12 +42,13 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
     if (
       old &&
       old.stateKey === stateKey &&
-      Date.now() - old.updatedAt < env.DEPTH_REFRESH_SECONDS * 1000
+      Date.now() - old.updatedAt < env.DEPTH_REFRESH_SECONDS * 1000 * (watched.has(pool.id) ? 0.5 : 1)
     ) {
       applyDepth(pool, old);
       cached++;
       continue;
     }
+    if (cacheOnly) continue;
     try {
       const spacing = details.tickSpacing!,
         tick = details.tick!;

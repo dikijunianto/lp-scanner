@@ -14,7 +14,7 @@ const { deriveBinArray, binIdToBinArrayIndex, getBinFromBinArray, MAX_BIN_ARRAY_
   require("@meteora-ag/dlmm") as typeof import("@meteora-ag/dlmm");
 const arraySize = MAX_BIN_ARRAY_SIZE.toNumber();
 
-export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Store) {
+export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Store, cacheOnly = false, watched = new Set<string>()) {
   const targets = pools
     .filter(
       (p) =>
@@ -35,12 +35,13 @@ export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store:
     if (
       old &&
       old.stateKey === stateKey &&
-      Date.now() - old.updatedAt < env.DEPTH_REFRESH_SECONDS * 1000
+      Date.now() - old.updatedAt < env.DEPTH_REFRESH_SECONDS * 1000 * (watched.has(pool.id) ? 0.5 : 1)
     ) {
       applyDepth(pool, old);
       cached++;
       continue;
     }
+    if (cacheOnly) continue;
     try {
       const activeId = details.activeBinId!,
         step = details.binStep!;

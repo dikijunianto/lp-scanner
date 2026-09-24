@@ -8,6 +8,7 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import { and, asc, desc, eq, gte, lt, lte, or } from "drizzle-orm";
 import * as schema from "./schema";
 import { env } from "../config/env";
+import { createResearchStore } from "./research";
 import type { Snapshot, Candle, PriceRecord, FeeWindow, Window, Confidence } from "../core/model";
 export interface FeeEventRow {
   poolId: string;
@@ -19,6 +20,18 @@ export interface FeeEventRow {
   volumeUsd: number | null;
   feesUsd: number | null;
   confidence: Confidence;
+  chain?: string | null;
+  poolAddress?: string | null;
+  amount0?: string | null;
+  amount1?: string | null;
+  priceUsd0?: number | null;
+  priceUsd1?: number | null;
+  grossFeeUsd?: number | null;
+  lpFeeUsd?: number | null;
+  feeTier?: number | null;
+  protocolFeeRaw?: string | null;
+  priceConfidence?: Confidence | null;
+  sender?: string | null;
 }
 export interface DepthRow {
   depth1PctUsd: number | null;
@@ -74,7 +87,9 @@ export function createStore(path = env.DATABASE_PATH) {
     })();
   }
   const db = drizzle(sqlite, { schema });
+  const research = createResearchStore(sqlite);
   return {
+    ...research,
     db,
     close: () => sqlite.close(),
     savePrices(records: PriceRecord[]) {
@@ -168,17 +183,25 @@ export function createStore(path = env.DATABASE_PATH) {
     ) {
       sqlite.transaction(() => {
         const insert = sqlite.prepare(`INSERT OR REPLACE INTO fee_events
-          (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence)
-          VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence)`);
-        for (const event of events) insert.run(event);
+          (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence,
+          chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender)
+          VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence,
+          @chain,@poolAddress,@amount0,@amount1,@priceUsd0,@priceUsd1,@grossFeeUsd,@lpFeeUsd,@feeTier,@protocolFeeRaw,@priceConfidence,@sender)`);
+        for (const event of events) insert.run({ chain: null, poolAddress: null, amount0: null, amount1: null,
+          priceUsd0: null, priceUsd1: null, grossFeeUsd: null, lpFeeUsd: null, feeTier: null,
+          protocolFeeRaw: null, priceConfidence: null, sender: null, ...event });
         sqlite
           .prepare(
             `INSERT INTO fee_cursors VALUES (?,?,?,?,?,?,?) ON CONFLICT(pool_id)
           DO UPDATE SET block_number=excluded.block_number, block_hash=excluded.block_hash,
+          start_block=MIN(fee_cursors.start_block,excluded.start_block),
+          start_time=MIN(fee_cursors.start_time,excluded.start_time),
           end_time=excluded.end_time, updated_at=excluded.updated_at`,
           )
           .run(poolId, blockNumber, blockHash, startBlock, startTime, endTime, Date.now());
       })();
+      if (events.length) research.rebuildFeeBucketsRange(poolId,
+        Math.min(...events.map((e) => e.timestamp)),Math.max(...events.map((e) => e.timestamp)));
     },
     feeEvents(poolId: string, from: number, to: number): FeeEventRow[] {
       const rows = sqlite
@@ -244,6 +267,10 @@ export function createStore(path = env.DATABASE_PATH) {
           }
         }
       });
+    },
+    replaceCurrent(item: Snapshot) {
+      sqlite.prepare("UPDATE pools SET data=? WHERE id=? AND updated_at=?")
+        .run(JSON.stringify(item), item.pool.id, item.pool.timestamp);
     },
     list() {
       return db

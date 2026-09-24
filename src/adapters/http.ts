@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import { env } from "../config/env";
+import { countApi, countCache } from "../core/traffic";
 export class HttpClient {
   private nextAt = 0;
   private cache = new Map<string, { until: number; data: unknown }>();
@@ -16,12 +17,13 @@ export class HttpClient {
   ): Promise<T> {
     const key = `${url}:${JSON.stringify(options.body ?? "")}`;
     const cached = this.cache.get(key);
-    if (cached && cached.until > Date.now()) return schema.parse(cached.data);
+    if (cached && cached.until > Date.now()) { countCache(); return schema.parse(cached.data); }
     for (let attempt = 0; attempt <= this.retries; attempt++) {
       const wait = Math.max(0, this.nextAt - Date.now());
       this.nextAt = Date.now() + wait + this.spacingMs;
       if (wait) await sleep(wait);
       try {
+        countApi();
         const response = await this.fetcher(url, {
           method: options.body ? "POST" : "GET",
           headers: {

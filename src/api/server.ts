@@ -6,10 +6,12 @@ import { env } from "../config/env";
 import { settings } from "../db/schema";
 import { createStore } from "../db/store";
 import { Scanner, log } from "../workers/scanner";
+import { BackgroundWorker } from "../workers/background";
 import { analyze, enrichHistory, simulateRanges } from "../core/analytics";
 import { safeError } from "../adapters/http";
 const store = createStore();
 const scanner = new Scanner(store);
+const background = new BackgroundWorker(store);
 for (const [key, value] of Object.entries({
   scanInterval: env.SCAN_INTERVAL_SECONDS,
   retentionDays: env.RETENTION_DAYS,
@@ -39,6 +41,7 @@ app.get("/health", async () => ({
   status: "ok",
   readOnly: true,
   scannerRunning: scanner.running,
+  backgroundRunning: background.running,
   lastRun: store.recentRuns()[0] ?? null,
 }));
 app.get("/pools", async () => ({
@@ -54,6 +57,32 @@ app.get("/pools", async () => ({
   },
 }));
 app.get("/alerts", async () => ({ alerts: store.recentAlerts() }));
+app.get("/watchlist", async () => ({ poolIds: [...store.watchedIds()] }));
+app.post("/watchlist", async (request, reply) => {
+  if (request.headers["content-type"]?.split(";")[0] !== "application/json")
+    return reply.code(415).send({ error: "JSON required" });
+  const { poolId, watched } = z.object({ poolId: z.string().min(1).max(180), watched: z.boolean() }).parse(request.body);
+  if (!store.watch(poolId, watched)) return reply.code(404).send({ error: "Pool not found" });
+  return { poolId, watched };
+});
+app.get("/research/signals", async () => ({ signals: store.listSignals(500).map((s) => ({
+  id: s.id, poolId: s.poolId, signalType: s.signalType, episodeStart: s.episodeStart,
+  episodeLastSeen: s.episodeLastSeen, episodeEnd: s.episodeEnd, peakScore: s.peakScore,
+  chain: s.data.pool.chain, protocol: s.data.pool.protocol, pair: s.data.pool.pair,
+  activity: s.data.metrics.activity, risk: s.data.metrics.risk,
+  confidence: s.data.metrics.dataQuality,
+})) }));
+app.get("/research/signals/:id", async (request, reply) => {
+  const { id } = z.object({ id: z.coerce.number().int().positive() }).parse(request.params);
+  const signal = store.signalDetail(id);
+  return signal ?? reply.code(404).send({ error: "Signal not found" });
+});
+app.get("/research/summary", async () => ({ facts: store.researchFacts() }));
+app.get("/research/coverage", async () => ({ coverage: store.coverage(), counts: store.researchCounts(env.OUTCOME_MAX_GAP_SECONDS*1000),
+  scan: store.recentScanMetrics(), worker: store.recentWorkerRun(), jobs: store.backfillStatus(20).map((j) => ({
+    poolId:j.pool_id,chain:j.chain,status:j.status,startBlock:j.start_block,endBlock:j.end_block,
+    retryCount:j.retry_count,failureReason:j.failure_reason,
+  })) }));
 app.get("/pools/:id", async (request, reply) => {
   const { id } = z.object({ id: z.string().min(1).max(180) }).parse(request.params);
   const item = store.get(id);
@@ -94,6 +123,7 @@ const close = async () => {
   closing = true;
   await app.close();
   await scanner.stop();
+  await background.stop();
   store.close();
 };
 process.on("SIGINT", () => void close());
@@ -101,3 +131,4 @@ process.on("SIGTERM", () => void close());
 await app.listen({ host: "127.0.0.1", port: env.API_PORT });
 log.info({ port: env.API_PORT }, "Read-only API listening");
 scanner.start();
+background.start();
