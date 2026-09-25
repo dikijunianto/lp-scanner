@@ -1,6 +1,6 @@
 import { horizons, type Horizon, type Outcome } from "./research";
 
-export const cohortVersion = "sprint5-v1";
+export const cohortVersion = "sprint6-v1";
 export function signalEvidenceConfidence(type: string, quality: string,
   fee: string, liquidity: string, price: string, depth: string) {
   const paired = (a: string,b: string) => a === "HIGH" && b === "HIGH" ? "HIGH" :
@@ -10,12 +10,13 @@ export function signalEvidenceConfidence(type: string, quality: string,
   if (type === "ACTIVITY_SURGE") return ["HIGH","MEDIUM"].includes(fee) ? fee : "UNAVAILABLE";
   return quality;
 }
-export type ConfidenceFilter = "HIGH" | "HIGH_MEDIUM" | "ALL";
+export type ConfidenceFilter = "HIGH" | "HIGH_MEDIUM" | "ALL" | "STRICT";
 export interface CohortFact {
   id: number; signalType: string; chain: string; protocol: string; trend: string;
   risk: number; activity: number | null; volatility: number | null;
   confidence: string; tokenAge: number | null; poolAge: number | null;
   horizon: Horizon; outcomeStatus: string; outcomeData: string | null;
+  sampleMeta?: string | null;
 }
 export interface Stats { n: number; median: number | null; p25: number | null; p75: number | null }
 export function quantiles(values: (number | null | undefined)[], min = 1): Stats {
@@ -49,8 +50,17 @@ const dimensionValue = (f: CohortFact, dimension: string) => {
 };
 const primary = new Set(["ACTIVITY_SURGE","HIGH_FEE_EFFICIENCY","HIGH_VOLUME_DEPTH","LOW_RISK_HIGH_ACTIVITY"]);
 const dimensions = ["all","chain","protocol","trend","risk","activity","volatility","confidence","tokenAge","poolAge"];
-const allowed = (confidence: string, filter: ConfidenceFilter) => filter === "ALL" || confidence === "HIGH" ||
-  (filter === "HIGH_MEDIUM" && confidence === "MEDIUM");
+export function strictSample(f:CohortFact) {
+  if(f.confidence!=="HIGH" || !f.sampleMeta) return false;
+  try { const m=JSON.parse(f.sampleMeta) as {priceFreshness?:string;providerIntegrityWarning?:boolean|null};
+    return m.priceFreshness==="FRESH" && m.providerIntegrityWarning===false;
+  } catch {return false;}
+}
+const allowed = (f:CohortFact, filter: ConfidenceFilter) => {
+  if(filter==="ALL") return true;
+  if(filter==="STRICT") return strictSample(f);
+  return f.confidence==="HIGH" || (filter==="HIGH_MEDIUM" && f.confidence==="MEDIUM");
+};
 export function buildCohorts(facts: CohortFact[], minSample = 30) {
   const signalMap = new Map<number,{fact:CohortFact;outcomes:Partial<Record<Horizon,Outcome>>}>();
   for (const f of facts) {
@@ -62,14 +72,14 @@ export function buildCohorts(facts: CohortFact[], minSample = 30) {
     signalMap.set(f.id,entry);
   }
   const result = [] as ReturnType<typeof aggregate>[];
-  for (const filter of ["HIGH","HIGH_MEDIUM","ALL"] as const) {
+  for (const filter of ["HIGH","HIGH_MEDIUM","ALL","STRICT"] as const) {
     const groups = new Map<string,{fact:CohortFact;outcomes:Partial<Record<Horizon,Outcome>>}[]>();
     for (const entry of signalMap.values()) {
-      if (!allowed(entry.fact.confidence,filter)) continue;
+      if (!allowed(entry.fact,filter)) continue;
       for (const dimension of dimensions) {
         const value = dimensionValue(entry.fact,dimension);
         const key = `${filter}|${entry.fact.signalType}|${dimension}|${value}`;
-        groups.set(key,[...(groups.get(key) ?? []),entry]);
+        const rows=groups.get(key)??[];rows.push(entry);groups.set(key,rows);
       }
     }
     for (const [key,entries] of groups) result.push(aggregate(key,entries,minSample));
@@ -78,11 +88,14 @@ export function buildCohorts(facts: CohortFact[], minSample = 30) {
 }
 function aggregate(key: string, entries: {fact:CohortFact;outcomes:Partial<Record<Horizon,Outcome>>}[], minSample: number) {
   const [confidenceFilter,signalType,dimension,value] = key.split("|");
-  const counts = Object.fromEntries((Object.keys(horizons) as Horizon[]).map((h)=>[h,entries.filter((e)=>e.outcomes[h]).length])) as Record<Horizon,number>;
+  const validOutcome=(o:Outcome|undefined)=>!!o &&
+    (confidenceFilter!=="STRICT" || (o.outcomeCompletenessPct??0)>=80);
+  const counts = Object.fromEntries((Object.keys(horizons) as Horizon[]).map((h)=>
+    [h,entries.filter((e)=>validOutcome(e.outcomes[h])).length])) as Record<Horizon,number>;
   const composition = Object.fromEntries(["HIGH","MEDIUM","LOW","UNAVAILABLE"].map((c)=>
     [c,entries.filter((e)=>e.fact.confidence===c).length]));
   const curves = (Object.keys(horizons) as Horizon[]).map((h) => {
-    const outcomes = entries.map((e)=>e.outcomes[h]).filter((o):o is Outcome=>!!o);
+    const outcomes = entries.map((e)=>e.outcomes[h]).filter((o):o is Outcome=>validOutcome(o));
     const stat = (read:(o:Outcome)=>number|null|undefined) => quantiles(outcomes.map(read),minSample);
     const range = (band:"2.5"|"5"|"10") => ({
       survival:stat((o)=>o.ranges[band]?.remainedInRange == null ? null : Number(o.ranges[band].remainedInRange)),

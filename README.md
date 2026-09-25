@@ -86,6 +86,8 @@ Sprint 2 adds active-liquidity provenance to each row and pool detail, plus a **
 
 Sprint 5 adds [RPC provider routing](docs/rpc-providers.md), [historical price backfill](docs/price-backfill.md), [depth freshness rules](docs/depth-coverage.md), [descriptive cohorts](docs/cohort-validation.md), and a [data health page](docs/data-health.md). Open `/diagnostics/data-health` for provider limitations, current versus stored fee coverage, and missing-price reasons. All new tables and columns use additive migration `0005_reliability.sql`.
 
+Sprint 6 documents [live fee indexing](docs/live-indexing.md), the [outcome pipeline](docs/outcome-pipeline.md), [depth priority](docs/depth-priority.md), [research quality](docs/research-quality.md), and [SQLite growth](docs/database-growth.md). The additive `0006_live_recovery.sql` migration keeps old events, signals, outcomes, prices, and snapshots intact.
+
 ## Metric definitions
 
 - **TVL:** total USD liquidity reported by the provider, including inactive liquidity.

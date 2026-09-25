@@ -1,0 +1,5 @@
+# SQLite size and retention forecast
+
+The scanner uses WAL mode and keeps all existing history. Sprint 6 adds only tables, columns and indexes. The data-health page reports database and WAL bytes, total rows, rows added in the last day/week, and estimated per-day/week/month bytes for swaps, snapshots, prices, signals and outcomes. Forecasts use the last-day row rate and a small sample of row lengths plus overhead; they are rough capacity planning figures, not a measured file-growth guarantee. No data is automatically deleted.
+
+`pool_snapshots` dominates space. Added time indexes support bounded recent-count queries rather than full-table scans on each diagnostics refresh. The operational checks include WAL size, checkpoint status, SQLite page/freelist counts and query plans. Use `PRAGMA optimize` when the app is stopped if planner statistics are stale. Retention or archival should follow measured size and the research horizons; do not delete outcome evidence or migrate to PostgreSQL without a demonstrated SQLite bottleneck.
