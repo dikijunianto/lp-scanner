@@ -77,12 +77,24 @@ app.get("/research/signals/:id", async (request, reply) => {
   const signal = store.signalDetail(id);
   return signal ?? reply.code(404).send({ error: "Signal not found" });
 });
-app.get("/research/summary", async () => ({ facts: store.researchFacts() }));
+app.get("/research/summary", async () => ({ facts: store.researchFacts(),
+  cohorts: store.cohorts().map((r) => JSON.parse(r.data)), minSample: env.COHORT_MIN_SAMPLE,
+  counts: store.researchCounts(env.OUTCOME_MAX_GAP_SECONDS*1000), outcomes: store.outcomeCoverage() }));
 app.get("/research/coverage", async () => ({ coverage: store.coverage(), counts: store.researchCounts(env.OUTCOME_MAX_GAP_SECONDS*1000),
   scan: store.recentScanMetrics(), worker: store.recentWorkerRun(), jobs: store.backfillStatus(20).map((j) => ({
     poolId:j.pool_id,chain:j.chain,status:j.status,startBlock:j.start_block,endBlock:j.end_block,
     retryCount:j.retry_count,failureReason:j.failure_reason,
   })) }));
+app.get("/diagnostics/data-health", async () => ({
+  generatedAt: Date.now(),
+  providers: store.rpcProviders(), usage: store.recentRpcUsage(), priceCalls: store.recentPriceCalls(),
+  coverage: store.coverage(), currentFees: store.currentFeeCoverage(),
+  historicalFees: store.historicalFeeCoverage(), priceBackfill: store.priceBackfillProgress(),
+  missingPriceReasons: store.priceReasonCounts(),
+  counts: store.researchCounts(env.OUTCOME_MAX_GAP_SECONDS*1000),
+  oldestJob: store.oldestBackfillJob(), scan: store.recentScanMetrics(),
+  worker: store.recentWorkerRun(),
+}));
 app.get("/pools/:id", async (request, reply) => {
   const { id } = z.object({ id: z.string().min(1).max(180) }).parse(request.params);
   const item = store.get(id);

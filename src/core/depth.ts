@@ -3,6 +3,18 @@ import { tokenUnits } from "./liquidity";
 
 const D = Decimal.clone({ precision: 80 });
 export const depthBands = [0.01, 0.025, 0.05, 0.1] as const;
+export function depthDriftPct(at: number | null | undefined, current: number | null | undefined) {
+  return at != null && current != null && at > 0 && Number.isFinite(at) && Number.isFinite(current)
+    ? Math.abs(current / at - 1) * 100 : null;
+}
+const priceBand = (price: number) => Math.round(Math.log(price)*20);
+export function v3DepthKey(tick: number, spacing: number, liquidity: string, price0: number, price1: number) {
+  return `${Math.floor(tick/(spacing*2))}:${Math.round(Math.log1p(Number(liquidity))*10)}:${priceBand(price0)}:${priceBand(price1)}`;
+}
+export function dlmmDepthKey(activeId: number, step: number, price0: number, price1: number) {
+  const binsPerBand = Math.max(1,Math.ceil(Math.log1p(0.02)/Math.log1p(step/10000)));
+  return `${Math.floor(activeId/binsPerBand)}:${priceBand(price0)}:${priceBand(price1)}`;
+}
 export interface DepthValues {
   depth1PctUsd: number | null;
   depth2_5PctUsd: number | null;

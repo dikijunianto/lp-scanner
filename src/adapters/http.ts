@@ -9,6 +9,7 @@ export class HttpClient {
     private spacingMs: number,
     private fetcher: typeof fetch = fetch,
     private retries = env.HTTP_RETRIES,
+    private timeoutMs = env.HTTP_TIMEOUT_MS,
   ) {}
   async json<T>(
     url: string,
@@ -31,7 +32,7 @@ export class HttpClient {
             ...(options.body ? { "content-type": "application/json" } : {}),
           },
           body: options.body ? JSON.stringify(options.body) : undefined,
-          signal: AbortSignal.timeout(env.HTTP_TIMEOUT_MS),
+          signal: AbortSignal.timeout(this.timeoutMs),
         });
         if (!response.ok) {
           if ((response.status === 429 || response.status >= 500) && attempt < this.retries) {

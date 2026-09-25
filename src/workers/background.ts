@@ -2,12 +2,12 @@ import { env, researchPolicy, priorityPolicy } from "../config/env";
 import { priorityScore } from "../core/research";
 import { withTraffic, type Traffic } from "../core/traffic";
 import type { Store } from "../db/store";
-import { ReadOnlyRpc } from "../adapters/liquidity-rpc";
-import { evmNetworks } from "../adapters/evm-liquidity";
-import { SOLANA_PUBLIC_RPC } from "../adapters/meteora-liquidity";
+import { RpcRouter } from "../adapters/rpc-router";
+import { backfillEventPrices } from "../adapters/historical-price";
 import { indexEvmFeeJob } from "../adapters/evm-fees";
 import { enrichEvmDepth } from "../adapters/evm-depth";
 import { enrichMeteoraDepth } from "../adapters/meteora-depth";
+import { buildCohorts } from "../core/cohorts";
 
 export class BackgroundWorker {
   private active: Promise<void> | null = null;
@@ -32,14 +32,22 @@ export class BackgroundWorker {
     try {
       const outcomes = this.store.evaluateDueOutcomes(researchPolicy(), Date.now(), 20);
       if (outcomes) notes.push(`${outcomes} outcomes evaluated`);
+      if (outcomes || !this.store.cohorts().length) {
+        const cohorts = buildCohorts(this.store.researchFacts(),env.COHORT_MIN_SAMPLE);
+        this.store.replaceCohorts(cohorts);
+        notes.push(`${cohorts.filter((c) => c.status === "VALID").length} valid cohorts`);
+      }
+      await Promise.all((["solana","base","bsc"] as const)
+        .map((chain) => new RpcRouter(chain,this.store).probeAll()));
+      const priceEvents = this.store.unpricedEvents(env.PRICE_BACKFILL_EVENTS_PER_CYCLE);
+      if (priceEvents.length) {
+        const prices = await backfillEventPrices(priceEvents,this.store);
+        notes.push(`Historical price backfill: ${prices.priced} priced, ${prices.missing} unavailable, ${prices.requests} calls`);
+      }
       const watched = this.store.watchedIds();
       const jobs = this.store.backfillJobs(env.BACKFILL_POOLS_PER_CYCLE);
       for (const { job, pool } of jobs) {
-        const rpc = new ReadOnlyRpc(
-          job.chain === "bsc"
-            ? (env.BSC_FEE_RPC_URL ?? "https://bsc.publicnode.com")
-            : (env.BASE_RPC_URL ?? evmNetworks.base.url),
-        );
+        const rpc = new RpcRouter(job.chain as "base" | "bsc",this.store);
         try {
           const metadata =
             pool.activeLiquidityDetails?.method === "V3_VIRTUAL_RESERVES_V1"
@@ -72,21 +80,18 @@ export class BackgroundWorker {
         );
       const sol = snapshots
         .filter((s) => s.pool.chain === "solana")
-        .slice(0, env.DEPTH_METEORA_LIMIT)
         .map((s) => s.pool);
       const base = snapshots
         .filter((s) => s.pool.chain === "base")
-        .slice(0, env.DEPTH_EVM_LIMIT)
         .map((s) => s.pool);
       const bsc = snapshots
         .filter((s) => s.pool.chain === "bsc")
-        .slice(0, env.DEPTH_EVM_LIMIT)
         .map((s) => s.pool);
       if (sol.length)
         notes.push(
           await enrichMeteoraDepth(
             sol,
-            new ReadOnlyRpc(env.SOLANA_RPC_URL ?? SOLANA_PUBLIC_RPC),
+            new RpcRouter("solana",this.store),
             this.store,
             false,
             watched,
@@ -96,7 +101,7 @@ export class BackgroundWorker {
         notes.push(
           await enrichEvmDepth(
             base,
-            new ReadOnlyRpc(env.BASE_DEPTH_RPC_URL ?? "https://base-rpc.publicnode.com"),
+            new RpcRouter("base",this.store),
             this.store,
             false,
             watched,
@@ -106,7 +111,7 @@ export class BackgroundWorker {
         notes.push(
           await enrichEvmDepth(
             bsc,
-            new ReadOnlyRpc(env.BSC_RPC_URL ?? evmNetworks.bsc.url),
+            new RpcRouter("bsc",this.store),
             this.store,
             false,
             watched,

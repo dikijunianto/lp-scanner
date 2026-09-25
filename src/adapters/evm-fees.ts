@@ -1,20 +1,13 @@
 import { z } from "zod";
 import { env } from "../config/env";
-import type { Pool, PriceRecord, Window, FeeWindow } from "../core/model";
+import type { Pool, Window, FeeWindow } from "../core/model";
 import { windows, windowMs } from "../core/model";
 import { fresh } from "../core/liquidity";
 import { decodeSwap, swapLogSchema, swapTopic, pancakeSwapTopic, swapUsd } from "../core/fees";
 import type { Store, FeeEventRow } from "../db/store";
 import type { BackfillJob } from "../db/research";
-import { HttpClient } from "./http";
 import { blockSchema, ReadOnlyRpc } from "./liquidity-rpc";
-
-const historical = new HttpClient(250);
-const priceResponse = z.object({ coins: z.record(z.string(), z.unknown()) });
-const priceCoin = z.object({
-  price: z.number().finite().positive(),
-  timestamp: z.number().int().positive(),
-});
+import { RpcRouter, isRangeError } from "./rpc-router";
 type Block = { hash: string; timestamp: number };
 const blockAt = async (rpc: ReadOnlyRpc, n: number): Promise<Block> => {
   const raw = blockSchema.parse(
@@ -24,39 +17,6 @@ const blockAt = async (rpc: ReadOnlyRpc, n: number): Promise<Block> => {
   return { hash: raw.hash, timestamp: Number(BigInt(raw.timestamp)) * 1000 };
 };
 
-async function historicalPrices(pool: Pool, timestamp: number, store: Store) {
-  const details = pool.activeLiquidityDetails!;
-  const bucket = Math.floor(timestamp / 300000) * 300000;
-  const keys = [details.token0Address, details.token1Address].map(
-    (a) => `${pool.chain}:${a.toLowerCase()}`,
-  );
-  if (keys.every((key) => store.priceAt(pool.chain, key.split(":")[1], timestamp, 600000))) return;
-  const data = await historical.json(
-    `${env.PRICE_API_URL}/prices/historical/${Math.floor(bucket / 1000)}/${keys.join(",")}?searchWidth=10m`,
-    priceResponse,
-    { ttl: 3600000 },
-  );
-  const observedAt = Date.now();
-  const records: PriceRecord[] = [];
-  for (let i = 0; i < keys.length; i++) {
-    const coin = priceCoin.safeParse(data.coins[keys[i]]);
-    if (!coin.success) continue;
-    const sourceTimestamp = coin.data.timestamp * 1000;
-    if (sourceTimestamp > bucket + 30000 || bucket - sourceTimestamp > 600000) continue;
-    records.push({
-      chain: pool.chain,
-      assetAddress: keys[i].split(":")[1],
-      symbol: i === 0 ? pool.token0.symbol : pool.token1.symbol,
-      priceUsd: coin.data.price,
-      source: "DefiLlama Coins API historical",
-      sourceTimestamp,
-      observedAt,
-      blockNumber: null,
-      confidence: "MEDIUM",
-    });
-  }
-  if (records.length) store.savePrices(records);
-}
 
 export async function readRange(
   pool: Pool,
@@ -66,17 +26,32 @@ export async function readRange(
   to: number,
 ) {
   const logs: z.infer<typeof swapLogSchema>[] = [];
-  for (let start = from; start <= to; start += env.FEE_LOG_BLOCK_CHUNK) {
-    const end = Math.min(to, start + env.FEE_LOG_BLOCK_CHUNK - 1);
-    const batch = z.array(swapLogSchema).parse(
-      await rpc.call("eth_getLogs", [
+  let range = rpc instanceof RpcRouter ? rpc.safeLogRange : env.FEE_LOG_BLOCK_CHUNK;
+  for (let start = from; start <= to;) {
+    const size = range;
+    const end = Math.min(to, start + size - 1);
+    let raw: unknown;
+    try {
+      raw = await rpc.call("eth_getLogs", [
         {
           address: pool.poolAddress,
           fromBlock: `0x${start.toString(16)}`,
           toBlock: `0x${end.toString(16)}`,
           topics: [pool.chain === "bsc" ? pancakeSwapTopic : swapTopic],
         },
-      ]),
+      ]);
+      if (rpc instanceof RpcRouter) rpc.noteLogRange(true,end-start+1);
+      if (rpc instanceof RpcRouter) range = Math.min(5000,Math.floor(range*1.25)+1);
+    } catch (error) {
+      if (rpc instanceof RpcRouter && size > 1 && isRangeError(error instanceof Error ? error.message : "")) {
+        rpc.noteLogRange(false,size);
+        range = Math.max(1,Math.floor(size/2));
+        continue;
+      }
+      throw error;
+    }
+    const batch = z.array(swapLogSchema).parse(
+      raw,
     );
     if (batch.some((log) => log.removed)) throw new Error("Removed log detected");
     if (
@@ -89,6 +64,7 @@ export async function readRange(
     )
       throw new Error("Malformed log range");
     logs.push(...batch);
+    start = end + 1;
   }
   const blocks = new Map<number, Block>();
   for (const log of logs)
@@ -119,19 +95,6 @@ export async function readRange(
       });
     }
   }
-  const buckets = [
-    ...new Set(
-      logs.map((log) =>
-        Math.floor(blocks.get(Number(BigInt(log.blockNumber)))!.timestamp / 300000),
-      ),
-    ),
-  ];
-  for (const bucket of buckets)
-    try {
-      await historicalPrices(pool, bucket * 300000, store);
-    } catch {
-      /* Unpriced events remain explicit gaps. */
-    }
   const details = pool.activeLiquidityDetails!;
   const events: FeeEventRow[] = [];
   for (const log of logs) {

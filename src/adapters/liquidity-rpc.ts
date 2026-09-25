@@ -8,7 +8,8 @@ export class ReadOnlyRpc {
     private url: string,
     private http = new HttpClient(250, fetch, 1),
     private batchSize = 10,
-  ) {}
+    private supportsBatch = true,
+  ) { if (!supportsBatch) this.batchSize = 1; }
   async batch(calls: { method: string; params: unknown[] }[]): Promise<unknown[]> {
     const allowed = [
       "eth_chainId",
@@ -28,23 +29,24 @@ export class ReadOnlyRpc {
         .map((c) => ({ ...c, jsonrpc: "2.0", id: ++this.id }));
       this.requests++;
       countRpc();
-      const response = await this.http.json(
+      const raw = await this.http.json(
         this.url,
-        z.array(
-          z.object({
-            id: z.number().int(),
-            result: z.unknown().optional(),
-            error: z.unknown().optional(),
-          }),
-        ),
-        { body: chunk },
+        z.union([z.array(z.object({ id: z.number().int(), result: z.unknown().optional(), error: z.unknown().optional() })),
+          z.object({ id: z.number().int(), result: z.unknown().optional(), error: z.unknown().optional() })]),
+        { body: this.supportsBatch ? chunk : chunk[0] },
       );
+      const response = Array.isArray(raw) ? raw : [raw];
       if (
         response.length !== chunk.length ||
         new Set(response.map((r) => r.id)).size !== chunk.length ||
         response.some((r) => !chunk.some((c) => c.id === r.id))
       )
         throw new Error("Malformed RPC batch");
+      const failed = response.find((r) => r.error);
+      if (failed) {
+        const error = z.object({ code: z.number().optional(), message: z.string().optional() }).safeParse(failed.error);
+        throw new Error(`RPC ${error.success ? error.data.code ?? "error" : "error"}: ${error.success ? (error.data.message ?? "unavailable").slice(0, 120) : "unavailable"}`);
+      }
       for (const request of chunk) {
         const r = response.find((r) => r.id === request.id)!;
         results.push(r.error ? undefined : r.result);

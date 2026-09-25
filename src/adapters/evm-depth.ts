@@ -1,6 +1,8 @@
 import { Interface } from "@ethersproject/abi";
 import { env } from "../config/env";
-import { tickDepth, type TickNet } from "../core/depth";
+import { depthDriftPct, v3DepthKey, tickDepth, type TickNet } from "../core/depth";
+import { priorityTier } from "../core/research";
+import { priorityPolicy } from "../config/env";
 import type { Pool } from "../core/model";
 import type { Store, DepthRow } from "../db/store";
 import { readContracts } from "./evm-liquidity";
@@ -11,40 +13,64 @@ const abi = new Interface([
   "function ticks(int24) view returns (uint128,int128,uint256,uint256,int56,uint160,uint32,bool)",
 ]);
 const wordOf = (tick: number, spacing: number) => Math.floor(Math.floor(tick / spacing) / 256);
-export function applyDepth(pool: Pool, row: DepthRow) {
-  pool.depth1PctUsd = row.depth1PctUsd;
-  pool.depth2_5PctUsd = row.depth2_5PctUsd;
-  pool.depth5PctUsd = row.depth5PctUsd;
-  pool.depth10PctUsd = row.depth10PctUsd;
-  pool.depthConfidence = row.confidence;
+export function applyDepth(pool: Pool, row: DepthRow, ttlMs = env.DEPTH_REFRESH_SECONDS * 1000) {
+  const drift = depthDriftPct(row.priceAtCalculation,pool.price);
+  const stale = drift === null || drift > env.DEPTH_PRICE_DRIFT_PCT;
+  pool.depth1PctUsd = stale ? null : row.depth1PctUsd;
+  pool.depth2_5PctUsd = stale ? null : row.depth2_5PctUsd;
+  pool.depth5PctUsd = stale ? null : row.depth5PctUsd;
+  pool.depth10PctUsd = stale ? null : row.depth10PctUsd;
+  pool.depthConfidence = stale ? "UNAVAILABLE" : row.confidence;
   pool.depthSource = row.source;
   pool.depthUpdatedAt = row.updatedAt;
-  pool.depthExpiresAt = row.updatedAt + env.DEPTH_REFRESH_SECONDS * 2000;
+  pool.depthExpiresAt = row.updatedAt + ttlMs;
+  pool.depthBlock = row.blockId;
+  pool.depthPriceAtCalculation = row.priceAtCalculation ?? null;
+  pool.depthCurrentPrice = pool.price;
+  pool.depthPriceDriftPct = drift;
+  pool.depthState = stale ? "STALE" : "CURRENT";
+}
+export function depthRefreshMs(pool: Pool, watched: boolean, activeSignal: boolean) {
+  if (watched || activeSignal) return 120000;
+  const tier = priorityTier(pool,false,undefined,priorityPolicy());
+  return tier === 1 ? 300000 : tier === 2 ? 900000 : 2700000;
+}
+export function depthTargets(pools: Pool[], store: Store, cacheOnly: boolean,
+  watched: Set<string>, limit: number) {
+  const active = store.activeSignalIds();
+  const rows = pools.map((pool) => ({pool,old:store.latestDepth(pool.id)}));
+  if (cacheOnly) return rows;
+  return rows.sort((a,b) => {
+    const score = (x: typeof a) => (watched.has(x.pool.id) ? 100000 : active.has(x.pool.id) ? 80000 : 0)
+      + (4-priorityTier(x.pool,false,undefined,priorityPolicy()))*10000
+      + (!x.old ? 5000 : Math.min(4000,(Date.now()-x.old.updatedAt)/60000));
+    return score(b)-score(a);
+  }).slice(0,limit);
 }
 export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Store, cacheOnly = false, watched = new Set<string>()) {
-  const targets = pools
+  const eligible = pools
     .filter(
       (p) =>
         p.activeLiquidityDetails?.method === "V3_VIRTUAL_RESERVES_V1" &&
         ["HIGH", "MEDIUM"].includes(p.token0.usdPriceConfidence ?? "UNAVAILABLE") &&
         ["HIGH", "MEDIUM"].includes(p.token1.usdPriceConfidence ?? "UNAVAILABLE"),
-    )
-    .slice(0, env.DEPTH_EVM_LIMIT);
+    );
+  const active = store.activeSignalIds();
+  const targets = depthTargets(eligible,store,cacheOnly,watched,env.DEPTH_EVM_LIMIT);
   let enriched = 0,
     cached = 0;
   const reasons = new Map<string, number>();
-  for (const pool of targets) {
+  for (const {pool,old} of targets) {
     const details = pool.activeLiquidityDetails!;
-    const stateKey = `${details.liquidityRaw}:${Math.round(Math.log(Number(details.sqrtPriceX96)) * 200)}:${Math.round(
-      Math.log(details.price0Usd) * 200,
-    )}:${Math.round(Math.log(details.price1Usd) * 200)}`;
-    const old = store.latestDepth(pool.id);
+    const stateKey = v3DepthKey(details.tick!,details.tickSpacing!,details.liquidityRaw!,
+      details.price0Usd,details.price1Usd);
     if (
       old &&
       old.stateKey === stateKey &&
-      Date.now() - old.updatedAt < env.DEPTH_REFRESH_SECONDS * 1000 * (watched.has(pool.id) ? 0.5 : 1)
+      Date.now() - old.updatedAt < depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)) &&
+      (depthDriftPct(old.priceAtCalculation,pool.price) ?? Infinity) <= env.DEPTH_PRICE_DRIFT_PCT
     ) {
-      applyDepth(pool, old);
+      applyDepth(pool, old, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
       cached++;
       continue;
     }
@@ -117,9 +143,11 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
         updatedAt: Date.now(),
         blockId: details.block,
         stateKey,
+        priceAtCalculation: pool.price,
+        methodologyVersion: "sprint5-v2",
       };
       store.saveDepth(pool.id, row);
-      applyDepth(pool, row);
+      applyDepth(pool, row, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
       enriched++;
     } catch (error) {
       const reason = error instanceof Error ? error.message : "RPC error";
