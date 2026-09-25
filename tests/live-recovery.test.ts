@@ -85,7 +85,8 @@ describe("Sprint 6 live recovery",()=>{
   it("classifies freshness, circuit failures, and depth blockers",()=>{
     expect(freshness(1000,2000,2000)).toBe("FRESH");
     expect(freshness(1000,5000,2000)).toBe("DELAYED");
-    expect(cursorLag(100,100000,90,0,110000)).toMatchObject({lagBlocks:10,lagSeconds:100,state:"FRESH"});
+    expect(cursorLag(100,100000,90,0,110000)).toMatchObject({lagBlocks:10,lagSeconds:110,
+      headAgeSeconds:10,state:"FRESH"});
     expect(providerFailureReason("HTTP 429")).toBe("RATE_LIMIT");
     expect(providerFailureReason("eth_getLogs disabled")).toBe("LOGS_DISABLED");
     expect(depthFailureReason("RPC_CAPABILITY_UNAVAILABLE bsc eth_call")).toBe("RPC_UNSUPPORTED");

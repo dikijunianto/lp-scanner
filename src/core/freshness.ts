@@ -7,8 +7,9 @@ export function freshness(at: number | null | undefined, now: number, freshMs: n
 export function cursorLag(headBlock: number | null, headTime: number | null,
   cursorBlock: number | null, cursorTime: number | null, now: number) {
   const lagBlocks = headBlock == null || cursorBlock == null ? null : Math.max(0,headBlock-cursorBlock);
-  const lagSeconds = headTime == null || cursorTime == null ? null : Math.max(0,(headTime-cursorTime)/1000);
-  return {lagBlocks,lagSeconds,state:cursorTime == null ? "UNAVAILABLE" as const :
+  const lagSeconds = cursorTime == null ? null : Math.max(0,(now-cursorTime)/1000);
+  const headAgeSeconds = headTime == null ? null : Math.max(0,(now-headTime)/1000);
+  return {lagBlocks,lagSeconds,headAgeSeconds,state:cursorTime == null ? "UNAVAILABLE" as const :
     freshness(cursorTime,now,120000,600000)};
 }
 export function depthFailureReason(message: string) {

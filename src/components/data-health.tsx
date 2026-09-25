@@ -15,7 +15,7 @@ type Health = {generatedAt:number;providers:Provider[];usage:Row[];priceCalls:Ro
   oldestJob:{oldest:number|null};scan:{duration_ms:number}|null;
   worker:{started_at:number;ended_at:number|null;notes:string}|null;
   liveCursors:{poolId:string;chain:string;blockNumber:number;headBlock:number;lagBlocks:number|null;
-    lagSeconds:number|null;state:string;sourceType:string;sourceId:string}[];
+    lagSeconds:number|null;headAgeSeconds:number|null;state:string;sourceType:string;sourceId:string}[];
   outcomePipeline:{horizon:string;eligible:number;complete:number;overdue:number;oldestReadyAgeMs:number|null;
     completionRate:number|null}[];
   outcomeMissingness:{horizon:string;reason:string;n:number}[];
@@ -65,10 +65,11 @@ export function DataHealthPage() {
       <p>Live event ingestion and overdue outcomes run before historical price backfill.</p></section>
     <section className="panel"><div className="eyebrow">LIVE FEE CURSORS · CURRENT, SEPARATE FROM HISTORY</div>
       <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>POOL</th><th>STATE</th>
-        <th>HEAD</th><th>CURSOR</th><th>LAG BLOCKS</th><th>LAG SECONDS</th><th>SOURCE</th></tr></thead><tbody>
+        <th>LAST HEAD</th><th>CURSOR</th><th>OBSERVED BLOCK GAP</th><th>TIME BEHIND</th><th>HEAD AGE</th><th>SOURCE</th></tr></thead><tbody>
         {(data?.liveCursors??[]).map((r)=><tr key={r.poolId}><td>{r.chain}</td><td>{r.poolId.slice(-12)}</td>
           <td>{r.state}</td><td>{r.headBlock}</td><td>{r.blockNumber}</td>
           <td>{r.lagBlocks??"—"}</td><td>{r.lagSeconds==null?"—":Math.round(r.lagSeconds)}</td>
+          <td>{r.headAgeSeconds==null?"—":Math.round(r.headAgeSeconds)}</td>
           <td>{r.sourceType} · {r.sourceId}</td></tr>)}</tbody></table></div></section>
     <section className="panel"><div className="eyebrow">OUTCOME PIPELINE · MATURITY AND DELAY</div>
       <div className="table-scroll"><table><thead><tr><th>HORIZON</th><th>ELIGIBLE</th><th>COMPLETE</th>
