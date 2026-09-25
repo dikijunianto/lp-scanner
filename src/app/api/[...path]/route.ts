@@ -8,6 +8,8 @@ export async function GET(
   const allowed =
     (path.length === 1 && ["health", "pools", "alerts", "watchlist"].includes(path[0])) ||
     (path.length === 2 && path[0] === "pools" && path[1].length <= 180) ||
+    (path.length === 2 && path[0] === "diagnostics" && path[1] === "data-health") ||
+    (path.length === 3 && path[0] === "diagnostics" && path[1] === "pool-freshness" && path[2].length <= 180) ||
     (path.length === 2 && path[0] === "research" && ["signals", "summary", "coverage"].includes(path[1])) ||
     (path.length === 3 && path[0] === "research" && path[1] === "signals" && /^\d+$/.test(path[2]));
   if (!allowed) return NextResponse.json({ error: "Not found" }, { status: 404 });

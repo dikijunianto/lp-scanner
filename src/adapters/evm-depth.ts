@@ -1,6 +1,6 @@
 import { Interface } from "@ethersproject/abi";
 import { env } from "../config/env";
-import { depthDriftPct, v3DepthKey, tickDepth, type TickNet } from "../core/depth";
+import { depthDriftPct, v3DepthKey, dlmmDepthKey, tickDepth, type TickNet } from "../core/depth";
 import { priorityTier } from "../core/research";
 import { priorityPolicy } from "../config/env";
 import type { Pool } from "../core/model";
@@ -40,7 +40,15 @@ export function depthTargets(pools: Pool[], store: Store, cacheOnly: boolean,
   const active = store.activeSignalIds();
   const rows = pools.map((pool) => ({pool,old:store.latestDepth(pool.id)}));
   if (cacheOnly) return rows;
-  return rows.sort((a,b) => {
+  return rows.filter(({pool,old})=>{
+    if(!old) return true;
+    const d=pool.activeLiquidityDetails!;
+    const key=d.method==="V3_VIRTUAL_RESERVES_V1"
+      ? v3DepthKey(d.tick!,d.tickSpacing!,d.liquidityRaw!,d.price0Usd,d.price1Usd)
+      : dlmmDepthKey(d.activeBinId!,d.binStep!,d.price0Usd,d.price1Usd);
+    return old.stateKey!==key || Date.now()-old.updatedAt>=depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id))
+      || (depthDriftPct(old.priceAtCalculation,pool.price)??Infinity)>env.DEPTH_PRICE_DRIFT_PCT;
+  }).sort((a,b) => {
     const score = (x: typeof a) => (watched.has(x.pool.id) ? 100000 : active.has(x.pool.id) ? 80000 : 0)
       + (4-priorityTier(x.pool,false,undefined,priorityPolicy()))*10000
       + (!x.old ? 5000 : Math.min(4000,(Date.now()-x.old.updatedAt)/60000));
@@ -78,15 +86,16 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
     try {
       const spacing = details.tickSpacing!,
         tick = details.tick!;
-      const lowerTick = Math.max(-887272, tick + Math.floor(Math.log(0.9) / Math.log(1.0001)) - 3);
+      const lowerTick = Math.max(-887272, tick + Math.floor(Math.log(0.95) / Math.log(1.0001)) - 3);
       const upperTick = Math.min(
         887272,
-        tick + Math.ceil(Math.log(1 / 0.9) / Math.log(1.0001)) + 3,
+        tick + Math.ceil(Math.log(1 / 0.95) / Math.log(1.0001)) + 3,
       );
       const firstWord = wordOf(lowerTick, spacing),
         lastWord = wordOf(upperTick, spacing);
       if (lastWord - firstWord + 1 > env.DEPTH_MAX_TICK_WORDS) {
         reasons.set("tick word cap", (reasons.get("tick word cap") ?? 0) + 1);
+        store.recordDepthFailure(pool.id,"tick word cap");
         continue;
       }
       const positions = Array.from({ length: lastWord - firstWord + 1 }, (_, i) => firstWord + i);
@@ -109,6 +118,7 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
       }
       if (ticks.length > env.DEPTH_MAX_INITIALIZED_TICKS) {
         reasons.set("initialized tick cap", (reasons.get("initialized tick cap") ?? 0) + 1);
+        store.recordDepthFailure(pool.id,"initialized tick cap");
         continue;
       }
       const rawTicks = await readContracts(
@@ -132,8 +142,9 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
         { lowerTick: firstWord * 256 * spacing, upperTick: ((lastWord + 1) * 256 - 1) * spacing },
         details.token0Address.toLowerCase() !== pool.token0Address.toLowerCase(),
       );
-      if (values.depth10PctUsd === null) {
+      if (values.depth5PctUsd === null) {
         reasons.set("incomplete range", (reasons.get("incomplete range") ?? 0) + 1);
+        store.recordDepthFailure(pool.id,"incomplete range");
         continue;
       }
       const row: DepthRow = {
@@ -152,6 +163,7 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
     } catch (error) {
       const reason = error instanceof Error ? error.message : "RPC error";
       reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+      store.recordDepthFailure(pool.id,reason);
     }
   }
   return `Depth: ${enriched} V3 refreshed, ${cached} cached; ${rpc.requests} RPC batches; ${[...reasons].map(([k, v]) => `${k} ${v}`).join(", ")}`;

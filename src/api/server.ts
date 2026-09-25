@@ -94,7 +94,24 @@ app.get("/diagnostics/data-health", async () => ({
   counts: store.researchCounts(env.OUTCOME_MAX_GAP_SECONDS*1000),
   oldestJob: store.oldestBackfillJob(), scan: store.recentScanMetrics(),
   worker: store.recentWorkerRun(),
+  liveCursors:store.liveCursorHealth(),
+  logSources:store.rpcProviders().filter((p)=>["base","bsc"].includes(p.chain)).map((p)=>({
+    chain:p.chain,sourceId:p.providerId,sourceType:"RPC_GET_LOGS",
+    latestIndexedBlock:store.liveCursorHealth().filter((c)=>c.sourceId===p.providerId)
+      .reduce<number|null>((n,c)=>Math.max(n??0,c.blockNumber),null),
+    latencyMs:p.latencyMs,historicalCoverage:"UNKNOWN",
+    confidence:p.supportsGetLogs===true && p.healthState==="HEALTHY"?"LOW":"UNAVAILABLE",
+    status:p.healthState,failureReason:p.failureReason,
+  })),outcomePipeline:store.outcomePipeline(),
+  outcomeMissingness:store.outcomeMissingness(),outcomeLag:store.outcomeCompletionLag(),
+  outcomeThroughput:store.outcomeThroughput(),outcomeConcurrency:env.OUTCOME_WORKER_CONCURRENCY,
+  depthFailures:store.depthFailureCounts(),bscDepthFailures:store.depthFailureCounts("bsc"),
+  databaseGrowth:store.databaseGrowth(),
 }));
+app.get("/diagnostics/pool-freshness/:id", async (request,reply) => {
+  const {id}=z.object({id:z.string().min(1).max(180)}).parse(request.params);
+  return store.poolFreshness(id)??reply.code(404).send({error:"Pool not found"});
+});
 app.get("/pools/:id", async (request, reply) => {
   const { id } = z.object({ id: z.string().min(1).max(180) }).parse(request.params);
   const item = store.get(id);

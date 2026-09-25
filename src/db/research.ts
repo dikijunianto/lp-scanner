@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import { signalEvidenceConfidence, type CohortFact } from "../core/cohorts";
 import type { Pool, Snapshot, FeeWindow, Window, PriceRecord } from "../core/model";
 import { windows, windowMs } from "../core/model";
+import { priorityPolicy } from "../config/env";
+import { freshness } from "../core/freshness";
 import {
   detectSignals,
   evaluateOutcome,
@@ -10,6 +12,7 @@ import {
   riskScoreVersion,
   scannerVersion,
   signalRuleVersion,
+  priorityTier,
   type Horizon,
   type Outcome,
   type SignalPolicy,
@@ -50,7 +53,7 @@ export interface OutcomeRow {
   signalId: number;
   horizon: Horizon;
   dueAt: number;
-  status: "PENDING" | "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
+  status: "PENDING" | "READY" | "RUNNING" | "COMPLETE" | "PARTIAL" | "FAILED" | "UNAVAILABLE";
   completedAt: number | null;
   data: Outcome | null;
 }
@@ -249,6 +252,8 @@ export function createResearchStore(sqlite: Database.Database) {
           .prepare("DELETE FROM fee_block_checkpoints WHERE pool_id=? AND block_number>=?")
           .run(poolId, fromBlock);
         sqlite.prepare("DELETE FROM fee_windows WHERE pool_id=?").run(poolId);
+        sqlite.prepare("DELETE FROM live_fee_cursors WHERE pool_id=? AND block_number>=?")
+          .run(poolId,fromBlock);
         if (ancestor)
           sqlite
             .prepare(
@@ -349,10 +354,12 @@ export function createResearchStore(sqlite: Database.Database) {
       from: number,
       to: number,
     ): { fees: number | null; volume: number | null } {
-      const cursor = sqlite
-        .prepare("SELECT start_time startTime,end_time endTime FROM fee_cursors WHERE pool_id=?")
-        .get(poolId) as { startTime: number; endTime: number } | undefined;
-      if (!cursor || cursor.startTime > from || cursor.endTime < to)
+      const covered = sqlite.prepare(`SELECT 1 FROM fee_cursors
+        WHERE pool_id=? AND start_time<=? AND end_time>=?
+        UNION ALL SELECT 1 FROM live_fee_cursors
+        WHERE pool_id=? AND start_time<=? AND end_time>=? LIMIT 1`)
+        .get(poolId,from,to,poolId,from,to);
+      if (!covered)
         return { fees: null, volume: null };
       const row = sqlite
         .prepare(
@@ -389,8 +396,8 @@ export function createResearchStore(sqlite: Database.Database) {
               sqlite
                 .prepare(
                   `INSERT INTO signal_episodes
-            (pool_id,signal_type,episode_start,episode_last_seen,peak_score,scanner_version,activity_score_version,risk_score_version,signal_rule_version,reason_json,data)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+            (pool_id,signal_type,episode_start,episode_last_seen,peak_score,scanner_version,activity_score_version,risk_score_version,signal_rule_version,reason_json,data,sample_meta)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
                 )
                 .run(
                   s.pool.id,
@@ -404,6 +411,19 @@ export function createResearchStore(sqlite: Database.Database) {
                   signalRuleVersion,
                   JSON.stringify({ reason: match.reason }),
                   JSON.stringify(s),
+                  JSON.stringify({discoveryTier:priorityTier(s.pool,!!sqlite.prepare("SELECT 1 FROM watchlist WHERE pool_id=?")
+                    .get(s.pool.id),s.metrics,priorityPolicy()),
+                    priceCoverageStatus:s.metrics.priceConfidence,
+                    priceFreshness:[s.pool.token0.usdPriceSourceTimestamp,s.pool.token1.usdPriceSourceTimestamp]
+                      .every((t)=>freshness(t,s.pool.timestamp,300000)==="FRESH")?"FRESH":"UNAVAILABLE",
+                    feeCoverageStatus:s.metrics.feeConfidence,
+                    depthCoverageStatus:s.pool.depthConfidence,
+                    enrichmentAvailability:{activeLiquidity:s.pool.activeLiquidityUsd!==null,
+                      depth5:s.pool.depth5PctUsd!==null,fees1h:s.pool.fees1h!==null},
+                    providerIntegrityWarning:(()=>{const health=sqlite.prepare(`SELECT COUNT(*) n,
+                      SUM(health_state='HEALTHY') healthy FROM rpc_providers WHERE chain=?`)
+                      .get(s.pool.chain) as {n:number;healthy:number|null};
+                      return health.n ? !health.healthy : null;})()}),
                 ).lastInsertRowid,
             );
             created.push(id);
@@ -425,16 +445,20 @@ export function createResearchStore(sqlite: Database.Database) {
           `SELECT o.*,s.data signal_data,s.id signal_id_full,s.pool_id,s.signal_type,s.episode_start,s.episode_last_seen,s.episode_end,s.peak_score,
         s.scanner_version,s.activity_score_version,s.risk_score_version,s.signal_rule_version,s.reason_json
         FROM signal_outcomes o JOIN signal_episodes s ON s.id=o.signal_id
-        WHERE o.status='PENDING' AND o.due_at+?<=? ORDER BY o.due_at LIMIT ?`,
+        WHERE o.status IN ('PENDING','READY') AND o.due_at+?<=?
+        ORDER BY CASE WHEN o.due_at>=?-900000 THEN 0 ELSE 1 END,
+          CASE WHEN json_extract(s.data,'$.metrics.dataQuality') IN ('HIGH','MEDIUM') THEN 0 ELSE 1 END,
+          CASE WHEN o.horizon IN ('4h','24h') THEN 0 ELSE 1 END,
+          o.due_at DESC LIMIT ?`,
         )
-        .all(graceMs, now, limit) as Record<string, unknown>[];
+        .all(graceMs, now, now, limit) as Record<string, unknown>[];
       return rows.map((r) => ({
         signal: signal({ ...r, id: r.signal_id_full, data: r.signal_data }),
         outcome: {
           signalId: Number(r.signal_id),
           horizon: r.horizon as Horizon,
           dueAt: Number(r.due_at),
-          status: "PENDING",
+          status: r.status as OutcomeRow["status"],
           completedAt: null,
           data: null,
         },
@@ -448,9 +472,10 @@ export function createResearchStore(sqlite: Database.Database) {
     ) {
       sqlite
         .prepare(
-          "UPDATE signal_outcomes SET status=?,completed_at=?,data=? WHERE signal_id=? AND horizon=? AND status='PENDING'",
+          "UPDATE signal_outcomes SET status=?,completed_at=?,data=?,completeness_pct=?,missing_reasons=?,last_error=NULL WHERE signal_id=? AND horizon=? AND status='RUNNING'",
         )
-        .run(status, Date.now(), JSON.stringify(data), signalId, horizon);
+        .run(status, Date.now(), JSON.stringify(data),data.outcomeCompletenessPct??null,
+          JSON.stringify(data.missingReasons??[]),signalId, horizon);
     },
     outcomeHistory(poolId: string, from: number, to: number): Snapshot[] {
       return (
@@ -461,29 +486,38 @@ export function createResearchStore(sqlite: Database.Database) {
           .all(poolId, from, to) as { data: string }[]
       ).map((r) => json(r.data));
     },
-    evaluateDueOutcomes(policy: SignalPolicy, now = Date.now(), limit = 10) {
-      let completed = 0;
-      for (const { signal: row, outcome } of this.dueOutcomes(
-        now,
-        limit,
-        policy.maxObservationGapMs,
-      )) {
-        const end = outcome.dueAt + policy.maxObservationGapMs;
-        const history = this.outcomeHistory(row.poolId, row.episodeStart, end);
-        const generated =
-          row.data.pool.chain === "solana"
-            ? { fees: null, volume: null }
-            : this.generatedFees(row.poolId, row.episodeStart, outcome.dueAt);
-        const data = evaluateOutcome(row.data, history, outcome.horizon, policy, generated);
-        const status =
-          data.endpointAt === null
-            ? "UNAVAILABLE"
-            : data.observationCoveragePct < 80
-              ? "PARTIAL"
-              : "COMPLETE";
-        this.completeOutcome(row.id, outcome.horizon, status, data);
-        completed++;
-      }
+    async evaluateDueOutcomes(policy: SignalPolicy, now = Date.now(), limit = 10, concurrency = 1) {
+      sqlite.prepare("UPDATE signal_outcomes SET status='READY' WHERE status='RUNNING' AND started_at<?")
+        .run(now-300000);
+      sqlite.prepare("UPDATE signal_outcomes SET status='READY' WHERE status='PENDING' AND due_at+?<=?")
+        .run(policy.maxObservationGapMs,now);
+      const jobs=this.dueOutcomes(now,limit,policy.maxObservationGapMs);
+      let next=0,completed=0;
+      await Promise.all(Array.from({length:Math.min(concurrency,jobs.length)},async()=>{
+        while(next<jobs.length) {
+          const {signal:row,outcome}=jobs[next++];
+          const claimed=sqlite.prepare(`UPDATE signal_outcomes SET status='RUNNING',started_at=?,attempts=attempts+1
+            WHERE signal_id=? AND horizon=? AND status='READY'`).run(Date.now(),row.id,outcome.horizon);
+          if (!claimed.changes) continue;
+          await new Promise<void>((resolve)=>setImmediate(resolve));
+          try {
+            const end=outcome.dueAt+policy.maxObservationGapMs;
+            const history=this.outcomeHistory(row.poolId,row.episodeStart,end);
+            const generated=row.data.pool.chain==="solana" ? {fees:null,volume:null}
+              : this.generatedFees(row.poolId,row.episodeStart,outcome.dueAt);
+            const data=evaluateOutcome(row.data,history,outcome.horizon,policy,generated);
+            const status=data.endpointAt!==null && data.observationCoveragePct>=80 &&
+              data.priceReturn!==null ? "COMPLETE" : (data.outcomeCompletenessPct??0)>0 ? "PARTIAL" : "UNAVAILABLE";
+            this.completeOutcome(row.id,outcome.horizon,status,data);
+            completed++;
+          } catch(error) {
+            const message=error instanceof Error ? error.message : "Outcome evaluation failed";
+            sqlite.prepare(`UPDATE signal_outcomes SET status=CASE WHEN attempts>=3 THEN 'FAILED' ELSE 'READY' END,
+              last_error=? WHERE signal_id=? AND horizon=? AND status='RUNNING'`)
+              .run(message.slice(0,200),row.id,outcome.horizon);
+          }
+        }
+      }));
       return completed;
     },
     listSignals(limit = 300): SignalRow[] {
@@ -508,7 +542,7 @@ export function createResearchStore(sqlite: Database.Database) {
         json_extract(s.data,'$.metrics.feeEfficiency1h') feeEfficiency,
         json_extract(s.data,'$.metrics.volumeDepthRatio1h') volumeDepth,
         json_extract(s.data,'$.pool.realizedVolatility1h') volatility,
-        json_extract(s.data,'$.metrics.trend') trend,
+        json_extract(s.data,'$.metrics.trend') trend,s.sample_meta sampleMeta,
         o.horizon,o.status outcomeStatus,o.data outcomeData
         FROM signal_episodes s LEFT JOIN signal_outcomes o ON o.signal_id=s.id
         WHERE s.id IN (SELECT id FROM signal_episodes ORDER BY episode_start DESC LIMIT ?)
@@ -543,14 +577,14 @@ export function createResearchStore(sqlite: Database.Database) {
       const one = (sql: string) => (sqlite.prepare(sql).get() as { n: number }).n;
       const oldest = (
         sqlite
-          .prepare("SELECT MIN(due_at) n FROM signal_outcomes WHERE status='PENDING' AND due_at+?<?")
+          .prepare("SELECT MIN(due_at) n FROM signal_outcomes WHERE status IN ('PENDING','READY','RUNNING') AND due_at+?<?")
           .get(graceMs, Date.now()) as { n: number | null }
       ).n;
       return {
         events: one("SELECT count(*) n FROM fee_events"),
         signals: one("SELECT count(*) n FROM signal_episodes"),
         completeOutcomes: one("SELECT count(*) n FROM signal_outcomes WHERE status='COMPLETE'"),
-        pendingOutcomes: one("SELECT count(*) n FROM signal_outcomes WHERE status='PENDING'"),
+        pendingOutcomes: one("SELECT count(*) n FROM signal_outcomes WHERE status IN ('PENDING','READY','RUNNING')"),
         queueLength: this.backfillQueueLength(),
         workerLagMs: oldest === null ? 0 : Math.max(0, Date.now() - oldest - graceMs),
       };

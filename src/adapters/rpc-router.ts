@@ -8,16 +8,17 @@ import { ReadOnlyRpc, blockSchema } from "./liquidity-rpc";
 import { evmNetworks } from "./evm-liquidity";
 import { SOLANA_PUBLIC_RPC } from "./meteora-liquidity";
 
-export const routerVersion = "sprint5-v1";
+export const routerVersion = "sprint6-v1";
 const minute = () => Math.floor(Date.now() / 60000) * 60000;
 const multicall = new Interface(["function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) returns (tuple(bool success,bytes returnData)[])"]);
 export function rpcUrls(chain: string) {
   const list = chain === "base" ? env.BASE_RPC_URLS : chain === "bsc" ? env.BNB_RPC_URLS : env.SOLANA_RPC_URLS;
+  const dedicated=chain==="bsc"?env.BSC_LOG_RPC_URLS.split(","):[];
   const prior = chain === "base" ? [env.BASE_RPC_URL,env.BASE_DEPTH_RPC_URL] : chain === "bsc"
     ? [env.BSC_FEE_RPC_URL,env.BSC_RPC_URL] : [env.SOLANA_RPC_URL];
   const defaults = chain === "base" ? [evmNetworks.base.url,"https://base-rpc.publicnode.com"]
     : chain === "bsc" ? ["https://bsc.publicnode.com",evmNetworks.bsc.url] : [SOLANA_PUBLIC_RPC];
-  return [...new Set([...list.split(","),...prior,...defaults].filter((x): x is string => !!x).map((x) => x.trim()))]
+  return [...new Set([...dedicated,...list.split(","),...prior,...defaults].filter((x): x is string => !!x).map((x) => x.trim()))]
     .filter((x) => { try { const u = new URL(x); return u.protocol === "https:" || (u.protocol === "http:" && ["localhost","127.0.0.1"].includes(u.hostname)); } catch { return false; } });
 }
 export function providerHealth(row: RpcProviderRow, now = Date.now()): RpcProviderRow["healthState"] {
@@ -32,9 +33,18 @@ export function nextLogRange(current: number, success: boolean, maximum: number)
 export function isRangeError(message: string) {
   return /range|too many|response size|limit exceeded|timeout|timed out|query returned/i.test(message);
 }
+export function providerFailureReason(message:string) {
+  if (/429|rate.limit/i.test(message)) return "RATE_LIMIT";
+  if (/timeout|timed out/i.test(message)) return "TIMEOUT";
+  if (/eth_getLogs.*disabled|logs.disabled/i.test(message)) return "LOGS_DISABLED";
+  if (/archive|missing trie|historical state/i.test(message)) return "ARCHIVE_MISSING";
+  if (/unsupported|method not found|403|capability/i.test(message)) return "UNSUPPORTED_METHOD";
+  return "SERVER_ERROR";
+}
 export class RpcRouter extends ReadOnlyRpc {
   private providers: { url: string; row: RpcProviderRow }[];
   private lastLogProvider: RpcProviderRow | null = null;
+  lastProviderId: string | null = null;
   constructor(public chain: "solana" | "base" | "bsc", private store: Store, urls = rpcUrls(chain)) {
     super("https://unused.invalid");
     const saved = new Map(store.rpcProviders().map((r) => [r.providerId,r]));
@@ -47,12 +57,14 @@ export class RpcRouter extends ReadOnlyRpc {
         supportsHistoricalState:null,safeLogRange:env.FEE_LOG_BLOCK_CHUNK,lastProbeAt:null,
         lastSuccessAt:null,lastFailureAt:null,latencyMs:null,errorRate:0,consecutiveFailures:0,
         cooldownUntil:0,healthState:"UNAVAILABLE" as const,
+        circuitState:"CLOSED" as const,failureReason:null,
       };
       store.saveRpcProvider(row);
       return { url,row };
     });
   }
   get providerCount() { return this.providers.length; }
+  get lastLogSourceId() { return this.lastLogProvider?.providerId ?? null; }
   get safeLogRange() {
     const capable = this.ordered("eth_getLogs",[]);
     return capable.length ? capable[0].row.safeLogRange : 1;
@@ -68,7 +80,11 @@ export class RpcRouter extends ReadOnlyRpc {
     const now = Date.now();
     const capability = method === "eth_getLogs" ? "supportsGetLogs" :
       method === "eth_call" && typeof params[1] === "string" && params[1] !== "latest" ? "supportsHistoricalState" : null;
-    return this.providers.filter((p) => p.row.cooldownUntil <= now && (capability !== "supportsGetLogs" || p.row.supportsGetLogs !== false))
+    return this.providers.filter((p) => {
+      if(p.row.cooldownUntil>now) return false;
+      if(p.row.circuitState==="OPEN") {p.row.circuitState="HALF_OPEN";this.store.saveRpcProvider(p.row);}
+      return capability!=="supportsGetLogs" || p.row.supportsGetLogs!==false;
+    })
       .sort((a,b) => {
         const score = (p: typeof a) => (capability && p.row[capability] === true ? 1000 : 0)
           + (method === "eth_getLogs" && p.row.supportsArchive === true ? 500 : 0)
@@ -80,11 +96,15 @@ export class RpcRouter extends ReadOnlyRpc {
   private record(row: RpcProviderRow, success: boolean, latency: number, error?: string) {
     row.errorRate = row.errorRate * 0.8 + (success ? 0 : 0.2);
     row.latencyMs = row.latencyMs === null ? latency : row.latencyMs * 0.7 + latency * 0.3;
-    if (success) { row.lastSuccessAt = Date.now(); row.consecutiveFailures = 0; row.cooldownUntil = 0; }
+    if (success) { row.lastSuccessAt = Date.now(); row.consecutiveFailures = 0; row.cooldownUntil = 0;
+      row.circuitState="CLOSED";row.failureReason=null; }
     else {
+      row.failureReason=providerFailureReason(error??"");
       row.lastFailureAt = Date.now(); row.consecutiveFailures++;
-      if (/429|rate.limit/i.test(error ?? "")) row.cooldownUntil = Date.now()+60000;
-      else if (row.consecutiveFailures >= 3) row.cooldownUntil = Date.now()+Math.min(300000,10000*row.consecutiveFailures);
+      if (row.failureReason==="RATE_LIMIT" || row.circuitState==="HALF_OPEN" || row.consecutiveFailures>=3) {
+        row.circuitState="OPEN";
+        row.cooldownUntil=Date.now()+(row.failureReason==="RATE_LIMIT"?60000:Math.min(300000,10000*Math.max(3,row.consecutiveFailures)));
+      }
     }
     row.healthState = providerHealth(row);
     this.store.saveRpcProvider(row);
@@ -117,6 +137,7 @@ export class RpcRouter extends ReadOnlyRpc {
           }
         this.requests += rpc.requests;
         this.record(p.row,true,Date.now()-started);
+        this.lastProviderId=p.row.providerId;
         return result;
       } catch (error) {
         this.requests += rpc.requests;
@@ -134,9 +155,31 @@ export class RpcRouter extends ReadOnlyRpc {
     throw last instanceof Error ? last : new Error("RPC_UNAVAILABLE");
   }
   async call(method: string, params: unknown[]) { return (await this.batch([{method,params}]))[0]; }
+  async verifyBscLogs(params:unknown[]):Promise<unknown|null> {
+    if(this.chain!=="bsc" || !this.lastProviderId) return null;
+    const other=this.ordered("eth_getLogs",params)
+      .find((p)=>p.row.providerId!==this.lastProviderId && p.row.supportsGetLogs===true);
+    if(!other) return null;
+    const usage=this.store.rpcUsage(other.row.providerId,this.chain,minute());
+    if(usage.provider>=env.RPC_PROVIDER_REQUESTS_PER_MINUTE || usage.chain>=env.RPC_CHAIN_REQUESTS_PER_MINUTE) return null;
+    const started=Date.now();
+    this.store.recordRpcRequest(other.row.providerId,minute(),1,1,0,0);
+    try {
+      const raw=await new ReadOnlyRpc(other.url,new HttpClient(0,fetch,0,env.RPC_CALL_TIMEOUT_MS),1,false)
+        .call("eth_getLogs",params);
+      this.record(other.row,true,Date.now()-started);
+      this.requests++;
+      return raw;
+    } catch(error) {
+      this.record(other.row,false,Date.now()-started,error instanceof Error?error.message:"RPC error");
+      return null;
+    }
+  }
   async probeAll() {
     await Promise.all(this.providers.map(async (p) => {
       if (p.row.lastProbeAt && Date.now()-p.row.lastProbeAt < env.RPC_PROBE_INTERVAL_SECONDS*1000) return;
+      if (p.row.circuitState==="OPEN" && p.row.cooldownUntil>Date.now()) return;
+      if (p.row.circuitState==="OPEN") p.row.circuitState="HALF_OPEN";
       const usage = this.store.rpcUsage(p.row.providerId,this.chain,minute());
       if (usage.provider+8 > env.RPC_PROVIDER_REQUESTS_PER_MINUTE ||
         usage.chain+8 > env.RPC_CHAIN_REQUESTS_PER_MINUTE) return;

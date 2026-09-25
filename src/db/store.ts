@@ -10,6 +10,7 @@ import * as schema from "./schema";
 import { env } from "../config/env";
 import { createResearchStore } from "./research";
 import { createReliabilityStore } from "./reliability";
+import { createLiveRecoveryStore } from "./live-recovery";
 import type { Snapshot, Candle, PriceRecord, FeeWindow, Window, Confidence } from "../core/model";
 export interface FeeEventRow {
   poolId: string;
@@ -92,9 +93,11 @@ export function createStore(path = env.DATABASE_PATH) {
   const db = drizzle(sqlite, { schema });
   const research = createResearchStore(sqlite);
   const reliability = createReliabilityStore(sqlite);
+  const liveRecovery = createLiveRecoveryStore(sqlite,path);
   return {
     ...research,
     ...reliability,
+    ...liveRecovery,
     db,
     close: () => sqlite.close(),
     savePrices(records: PriceRecord[]) {
@@ -163,6 +166,7 @@ export function createStore(path = env.DATABASE_PATH) {
           .prepare("DELETE FROM fee_events WHERE pool_id=? AND block_number>=?")
           .run(poolId, fromBlock);
         sqlite.prepare("DELETE FROM fee_windows WHERE pool_id=?").run(poolId);
+        sqlite.prepare("DELETE FROM live_fee_cursors WHERE pool_id=?").run(poolId);
         sqlite.prepare("DELETE FROM fee_cursors WHERE pool_id=?").run(poolId);
       })();
     },
@@ -190,7 +194,7 @@ export function createStore(path = env.DATABASE_PATH) {
       endTime: number,
     ) {
       sqlite.transaction(() => {
-        const insert = sqlite.prepare(`INSERT OR REPLACE INTO fee_events
+        const insert = sqlite.prepare(`INSERT OR IGNORE INTO fee_events
           (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence,
           chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender)
           VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence,
@@ -224,7 +228,9 @@ export function createStore(path = env.DATABASE_PATH) {
     },
     saveFeeWindow(poolId: string, window: Window, data: FeeWindow) {
       sqlite
-        .prepare("INSERT OR REPLACE INTO fee_windows VALUES (?,?,?,?)")
+        .prepare(`INSERT INTO fee_windows VALUES (?,?,?,?) ON CONFLICT(pool_id,window_name,window_end)
+          DO UPDATE SET data=excluded.data WHERE json_extract(fee_windows.data,'$.methodology')!='EVENT_DERIVED'
+            OR json_extract(excluded.data,'$.methodology')='EVENT_DERIVED'`)
         .run(poolId, window, data.windowEnd, JSON.stringify(data));
     },
     latestDepth(poolId: string): DepthRow | null {

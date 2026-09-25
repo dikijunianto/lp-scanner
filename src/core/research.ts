@@ -1,6 +1,6 @@
 import type { Snapshot, Pool, Metrics, Confidence } from "./model";
 
-export const scannerVersion = "5.0.0";
+export const scannerVersion = "6.0.0";
 export const activityScoreVersion = "sprint3-v1";
 export const riskScoreVersion = "sprint3-v1";
 export const signalRuleVersion = "sprint4-v1";
@@ -125,6 +125,19 @@ export interface Outcome {
   volumePersistence: number | null;
   riskChange: number | null;
   ranges: Record<"2.5" | "5" | "10", RangeOutcome>;
+  outcomeCompletenessPct?: number;
+  missingReasons?: string[];
+}
+
+export function outcomeMissingReasons(value: Pick<Outcome,"endpointAt"|"priceReturn"|"feesGenerated"|
+  "depth5PctChange"|"ranges"|"observationCoveragePct">) {
+  const reasons:string[]=[];
+  if (value.endpointAt===null) reasons.push("NO_SNAPSHOT");
+  if (value.priceReturn===null) reasons.push("MISSING_PRICE");
+  if (value.feesGenerated===null) reasons.push("MISSING_FEE_DATA");
+  if (value.depth5PctChange===null) reasons.push("MISSING_DEPTH");
+  if (value.observationCoveragePct<80) reasons.push("INSUFFICIENT_OBSERVATIONS");
+  return reasons;
 }
 
 export function evaluateOutcome(
@@ -212,7 +225,7 @@ export function evaluateOutcome(
       timeSpentInRangePct: enough ? Math.min(100, (insideMs / horizons[horizon]) * 100) : null,
     };
   }
-  return {
+  const result:Outcome = {
     endpointAt: endpoint?.pool.timestamp ?? null,
     observationCoveragePct: coverage,
     priceReturn: endpoint ? change(startPrice, endpoint.pool.price) : null,
@@ -235,6 +248,13 @@ export function evaluateOutcome(
     riskChange: endpoint ? endpoint.metrics.risk - signal.metrics.risk : null,
     ranges,
   };
+  const complete=[result.endpointAt,result.priceReturn,result.feesGenerated,result.volumeGenerated,
+    result.activeLiquidityChange,result.depth5PctChange,result.activityPersistence,
+    result.ranges["2.5"].remainedInRange,result.ranges["5"].remainedInRange,
+    result.ranges["10"].remainedInRange].filter((v)=>v!==null).length;
+  result.outcomeCompletenessPct=complete*10;
+  result.missingReasons=outcomeMissingReasons(result);
+  return result;
 }
 
 export interface PriorityPolicy {

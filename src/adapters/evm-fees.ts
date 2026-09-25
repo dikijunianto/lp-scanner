@@ -8,7 +8,10 @@ import type { Store, FeeEventRow } from "../db/store";
 import type { BackfillJob } from "../db/research";
 import { blockSchema, ReadOnlyRpc } from "./liquidity-rpc";
 import { RpcRouter, isRangeError } from "./rpc-router";
+import { reconcileSwapLogs } from "./log-sources";
 type Block = { hash: string; timestamp: number };
+export const liveCursorNeedsRestart = (cursorEndTime:number,updatedAt:number,
+  confirmedTime:number,now=Date.now()) => confirmedTime-cursorEndTime>600000 && now-updatedAt>600000;
 const blockAt = async (rpc: ReadOnlyRpc, n: number): Promise<Block> => {
   const raw = blockSchema.parse(
     await rpc.call("eth_getBlockByNumber", [`0x${n.toString(16)}`, false]),
@@ -27,19 +30,23 @@ export async function readRange(
 ) {
   const logs: z.infer<typeof swapLogSchema>[] = [];
   let range = rpc instanceof RpcRouter ? rpc.safeLogRange : env.FEE_LOG_BLOCK_CHUNK;
+  let verified=false;
   for (let start = from; start <= to;) {
     const size = range;
     const end = Math.min(to, start + size - 1);
     let raw: unknown;
     try {
-      raw = await rpc.call("eth_getLogs", [
-        {
+      const params=[{
           address: pool.poolAddress,
           fromBlock: `0x${start.toString(16)}`,
           toBlock: `0x${end.toString(16)}`,
           topics: [pool.chain === "bsc" ? pancakeSwapTopic : swapTopic],
-        },
-      ]);
+        }];
+      raw = await rpc.call("eth_getLogs",params);
+      if(!verified && pool.chain==="bsc" && rpc instanceof RpcRouter) {
+        const alternate=await rpc.verifyBscLogs(params);
+        if(alternate!==null) {raw=reconcileSwapLogs(raw,alternate);verified=true;}
+      }
       if (rpc instanceof RpcRouter) rpc.noteLogRange(true,end-start+1);
       if (rpc instanceof RpcRouter) range = Math.min(5000,Math.floor(range*1.25)+1);
     } catch (error) {
@@ -194,10 +201,6 @@ export async function indexEvmFeeJob(
   if (confirmedNumber < 0) throw new Error("No confirmed block");
   const confirmed = await blockAt(rpc, confirmedNumber);
   if (!fresh(confirmed.timestamp, Date.now(), 120000)) throw new Error("Stale confirmed block");
-  // Preserve old swaps, but restart the contiguous cursor when catching up would delay recent 1h windows.
-  const previous = store.feeCursor(pool.id);
-  if (previous && previous.endTime < confirmed.timestamp - windowMs["1h"])
-    store.restartFeeCursorFromHead(pool.id);
   let cursor = await validateCursor(pool.id, store.feeCursor(pool.id), rpc, store);
   if (cursor && cursor.blockNumber > confirmedNumber) throw new Error("Fee RPC fell behind cursor");
   let indexed = 0,
@@ -281,4 +284,44 @@ export async function indexEvmFeeJob(
     nextAttemptAt: 0,
   });
   return { indexed, backfilled, status, windows: feeWindows, rpcRequests: rpc.requests };
+}
+
+// A separate contiguous cursor keeps recent windows moving even while older history is missing.
+export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
+  if (pool.activeLiquidityDetails?.method !== "V3_VIRTUAL_RESERVES_V1" || pool.feeTier === null)
+    throw new Error("Pool lacks current V3 metadata");
+  const head=blockSchema.parse(await rpc.call("eth_getBlockByNumber",["latest",false]));
+  const headBlock=Number(BigInt(head.number));
+  const headTime=Number(BigInt(head.timestamp))*1000;
+  if (!fresh(headTime,Date.now(),120000)) throw new Error("Stale live RPC head");
+  const confirmedBlock=headBlock-env.FEE_CONFIRMATIONS;
+  const confirmed=await blockAt(rpc,confirmedBlock);
+  let cursor=store.liveFeeCursor(pool.id);
+  if (cursor) {
+    const current=await blockAt(rpc,cursor.blockNumber);
+    if (current.hash.toLowerCase()!==cursor.blockHash.toLowerCase() ||
+      liveCursorNeedsRestart(cursor.endTime,cursor.updatedAt,confirmed.timestamp)) {
+      store.resetLiveFeeCursor(pool.id);
+      cursor=null;
+    }
+  }
+  const bootstrap=pool.chain==="bsc" ? env.BSC_LIVE_BOOTSTRAP_BLOCKS : env.BASE_LIVE_BOOTSTRAP_BLOCKS;
+  const from=cursor ? cursor.blockNumber+1 : Math.max(0,confirmedBlock-bootstrap);
+  const to=Math.min(confirmedBlock,from+env.LIVE_MAX_BLOCKS_PER_JOB-1);
+  if (from>to) return {indexed:0,cursor,headBlock,headTime,status:"CURRENT"};
+  const batch=await readRange(pool,rpc,store,from,to);
+  store.saveLiveFeeBatch(pool.id,pool.chain,batch.events,from,batch.first.timestamp,to,batch.last.hash,
+    batch.last.timestamp,headBlock,headTime,"RPC_GET_LOGS",
+    rpc instanceof RpcRouter ? rpc.lastLogSourceId ?? "UNKNOWN" : "DIRECT_RPC");
+  cursor=store.liveFeeCursor(pool.id);
+  if (!cursor) throw new Error("Live fee cursor not saved");
+  const end=Math.floor(cursor.endTime/60000)*60000;
+  for (const window of windows) {
+    const covered=cursor.startTime<=end-windowMs[window] &&
+      confirmed.timestamp-cursor.endTime<=180000;
+    store.saveFeeWindow(pool.id,window,store.materializedFeeWindow(pool.id,window,end,covered,
+      cursor.startBlock,cursor.blockNumber));
+  }
+  return {indexed:batch.events.length,cursor,headBlock,headTime,
+    status:confirmedBlock-cursor.blockNumber<=bootstrap/20 ? "CURRENT" : "CATCHING_UP"};
 }

@@ -1,0 +1,5 @@
+# Research quality and selection
+
+The research dashboard defaults to **Standard** (HIGH + MEDIUM). **Strict** additionally requires HIGH signal evidence, a fresh timestamped pair price at signal time, no recorded provider-integrity warning, and at least 80% outcome field completeness. **All** shows everything with visible provenance; HIGH-only remains available. Every displayed statistic still requires its own non-null sample count of at least `COHORT_MIN_SAMPLE` (default 30). The dataset remains descriptive and contains no strategy recommendation or predicted return.
+
+New signal episodes persist discovery tier, price/fee/depth coverage, available enrichment, and price freshness in `sample_meta`. Older episodes have null metadata; Strict excludes them rather than silently guessing. Outcomes retain per-field missingness and a completion percentage. Range survival for 4h/24h is labeled immature until enough genuinely complete outcomes exist. Cohort composition can be biased toward pools that were easier to discover, price or enrich; the metadata enables that bias to be measured later.

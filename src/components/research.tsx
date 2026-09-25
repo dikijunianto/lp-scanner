@@ -6,7 +6,7 @@ import { useData } from "./use-data";
 import { usd, efficiency, multiple } from "./format";
 import type { Snapshot } from "@/core/model";
 import type { Outcome, Horizon } from "@/core/research";
-import type { CohortAggregate } from "@/core/cohorts";
+import { strictSample, type CohortAggregate } from "@/core/cohorts";
 
 const when = (time: number | null) => (time ? new Date(time).toLocaleString() : "—");
 const pct = (n: number | null | undefined) => (n == null ? "—" : `${(n * 100).toFixed(1)}%`);
@@ -336,6 +336,7 @@ interface Fact {
   horizon: Horizon;
   outcomeStatus: string;
   outcomeData: string | null;
+  sampleMeta?: string | null;
 }
 const bucket = (value: number | null, kind: "fee" | "depth" | "vol") =>
   value == null
@@ -382,8 +383,8 @@ export function ResearchSummary() {
           (chain === "all" || f.chain === chain) &&
           (protocol === "all" || f.protocol === protocol) &&
           (kind === "all" || f.signalType === kind) &&
-          (confidence === "ALL" || (confidence === "HIGH_MEDIUM" ?
-            ["HIGH","MEDIUM"].includes(f.confidence) : f.confidence === "HIGH")) &&
+          (confidence === "ALL" || (confidence === "STRICT" ? strictSample(f) :
+            confidence === "HIGH_MEDIUM" ? ["HIGH","MEDIUM"].includes(f.confidence) : f.confidence === "HIGH")) &&
           (trend === "all" || f.trend === trend) &&
           f.pair.toLowerCase().includes(pair.toLowerCase()) &&
           (minActivity === "" || (f.activity != null && f.activity >= Number(minActivity))) &&
@@ -424,7 +425,8 @@ export function ResearchSummary() {
   }, [selected]);
   const outcome = (rows: Fact[], h: Horizon): Outcome[] =>
     rows
-      .filter((r) => r.horizon === h && r.outcomeStatus === "COMPLETE" && r.outcomeData)
+      .filter((r) => r.horizon === h && r.outcomeStatus === "COMPLETE" && r.outcomeData &&
+        (confidence!=="STRICT" || (JSON.parse(r.outcomeData) as Outcome).outcomeCompletenessPct!>=80))
       .map((r) => JSON.parse(r.outcomeData!) as Outcome);
   const render = (rows: Fact[], label: string, count: number) => {
     const one = outcome(rows, "1h"),
@@ -511,9 +513,10 @@ export function ResearchSummary() {
           <label>
             CONFIDENCE
             <select value={confidence} onChange={(e) => setConfidence(e.target.value)}>
-              <option value="HIGH_MEDIUM">High + medium</option>
+              <option value="HIGH_MEDIUM">Standard · high + medium</option>
+              <option value="STRICT">Strict · complete evidence</option>
               <option value="HIGH">High only</option>
-              <option value="ALL">All</option>
+              <option value="ALL">All · with provenance</option>
             </select>
           </label>
           <label>

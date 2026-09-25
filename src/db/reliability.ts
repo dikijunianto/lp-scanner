@@ -20,6 +20,8 @@ export interface RpcProviderRow {
   consecutiveFailures: number;
   cooldownUntil: number;
   healthState: "HEALTHY" | "DEGRADED" | "COOLDOWN" | "UNAVAILABLE";
+  circuitState: "CLOSED" | "OPEN" | "HALF_OPEN";
+  failureReason: string | null;
 }
 export interface UnpricedEvent {
   poolId: string;
@@ -53,13 +55,18 @@ export function createReliabilityStore(sqlite: Database.Database) {
         latencyMs: r.latency_ms == null ? null : Number(r.latency_ms), errorRate: Number(r.error_rate),
         consecutiveFailures: Number(r.consecutive_failures), cooldownUntil: Number(r.cooldown_until),
         healthState: r.health_state as RpcProviderRow["healthState"],
+        circuitState: r.circuit_state as RpcProviderRow["circuitState"],
+        failureReason: r.failure_reason == null ? null : String(r.failure_reason),
       }));
     },
     saveRpcProvider(r: RpcProviderRow) {
-      sqlite.prepare(`INSERT INTO rpc_providers VALUES
+      sqlite.prepare(`INSERT INTO rpc_providers
+        (provider_id,chain,url_hash,provider_type,supports_archive,supports_get_logs,supports_batching,
+        supports_multicall,supports_historical_state,safe_log_range,last_probe_at,last_success_at,last_failure_at,
+        latency_ms,error_rate,consecutive_failures,cooldown_until,health_state,router_version,circuit_state,failure_reason) VALUES
         (@providerId,@chain,@urlHash,@providerType,@supportsArchive,@supportsGetLogs,@supportsBatching,
         @supportsMulticall,@supportsHistoricalState,@safeLogRange,@lastProbeAt,@lastSuccessAt,@lastFailureAt,
-        @latencyMs,@errorRate,@consecutiveFailures,@cooldownUntil,@healthState,'sprint5-v1')
+        @latencyMs,@errorRate,@consecutiveFailures,@cooldownUntil,@healthState,'sprint6-v1',@circuitState,@failureReason)
         ON CONFLICT(provider_id) DO UPDATE SET
         supports_archive=excluded.supports_archive,supports_get_logs=excluded.supports_get_logs,
         supports_batching=excluded.supports_batching,supports_multicall=excluded.supports_multicall,
@@ -67,7 +74,9 @@ export function createReliabilityStore(sqlite: Database.Database) {
         last_probe_at=excluded.last_probe_at,last_success_at=excluded.last_success_at,
         last_failure_at=excluded.last_failure_at,latency_ms=excluded.latency_ms,
         error_rate=excluded.error_rate,consecutive_failures=excluded.consecutive_failures,
-        cooldown_until=excluded.cooldown_until,health_state=excluded.health_state`).run({
+        cooldown_until=excluded.cooldown_until,health_state=excluded.health_state,
+        circuit_state=excluded.circuit_state,failure_reason=excluded.failure_reason,
+        router_version=excluded.router_version`).run({
         ...r, supportsArchive: r.supportsArchive == null ? null : Number(r.supportsArchive),
         supportsGetLogs: r.supportsGetLogs == null ? null : Number(r.supportsGetLogs),
         supportsBatching: r.supportsBatching == null ? null : Number(r.supportsBatching),
@@ -188,7 +197,9 @@ export function createReliabilityStore(sqlite: Database.Database) {
         SUM(EXISTS(SELECT 1 FROM fee_windows f WHERE f.pool_id=p.id AND f.window_name='1h'
           AND f.window_end>=? AND json_extract(f.data,'$.methodology')='EVENT_DERIVED')) complete_1h,
         SUM(EXISTS(SELECT 1 FROM fee_windows f WHERE f.pool_id=p.id AND f.window_name='4h'
-          AND f.window_end>=? AND json_extract(f.data,'$.methodology')='EVENT_DERIVED')) complete_4h
+          AND f.window_end>=? AND json_extract(f.data,'$.methodology')='EVENT_DERIVED')) complete_4h,
+        MAX((SELECT MAX(f.window_end) FROM fee_windows f WHERE f.pool_id=p.id AND f.window_name='1h'
+          AND json_extract(f.data,'$.methodology')='EVENT_DERIVED')) last_complete_1h
         FROM pools p WHERE p.chain IN ('base','bsc') AND p.updated_at>=?
         GROUP BY p.chain`).all(Date.now()-300000,Date.now()-300000,Date.now()-300000);
     },

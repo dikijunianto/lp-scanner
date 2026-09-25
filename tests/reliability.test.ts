@@ -89,6 +89,22 @@ describe("RPC provider reliability", () => {
       expect(store.rpcProviders().find((r)=>r.consecutiveFailures>0)).toBeTruthy();
     } finally { store.close(); }
   });
+  it("keeps log provenance when later block reads use another provider", async () => {
+    mockRpc((url,request) => {
+      if (request.method==="eth_getLogs") return [];
+      if (url.includes("logs.example")) return new Response(null,{status:429});
+      return {number:"0x10",hash:hash("a"),timestamp:`0x${Math.floor(Date.now()/1000).toString(16)}`};
+    });
+    const store=createStore(":memory:");
+    try {
+      const router=new RpcRouter("base",store,["https://logs.example","https://blocks.example"]);
+      await router.call("eth_getLogs",[{fromBlock:"0x1",toBlock:"0x1"}]);
+      const source=router.lastLogSourceId;
+      await router.call("eth_getBlockByNumber",["latest",false]);
+      expect(router.lastProviderId).not.toBe(source);
+      expect(router.lastLogSourceId).toBe(source);
+    } finally {store.close();}
+  });
 });
 
 describe("historical price backfill and depth validity", () => {

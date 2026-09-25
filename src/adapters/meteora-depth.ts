@@ -117,6 +117,7 @@ export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store:
     } catch (error) {
       const reason = error instanceof Error ? error.message : "RPC error";
       reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+      store.recordDepthFailure(pool.id,reason);
     }
   }
   return `Depth: ${enriched} DLMM refreshed, ${cached} cached; ${rpc.requests} RPC batches; ${[...reasons].map(([k, v]) => `${k} ${v}`).join(", ")}`;
