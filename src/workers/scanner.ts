@@ -56,17 +56,16 @@ export class Scanner {
             this.store.savePrices(priced.records);
             notes.push(priced.note);
           }
-          notes.push(await enrichLiquidity(pools));
+          notes.push(await enrichLiquidity(pools,this.store));
           if (env.ACTIVE_LIQUIDITY_ENABLED && pools.length) {
             try {
-              const { ReadOnlyRpc } = await import("../adapters/liquidity-rpc");
+              const { RpcRouter } = await import("../adapters/rpc-router");
               if (pools[0].chain === "solana") {
                 const { enrichMeteoraDepth } = await import("../adapters/meteora-depth");
-                const { SOLANA_PUBLIC_RPC } = await import("../adapters/meteora-liquidity");
                 notes.push(
                   await enrichMeteoraDepth(
                     pools,
-                    new ReadOnlyRpc(env.SOLANA_RPC_URL ?? SOLANA_PUBLIC_RPC),
+                    new RpcRouter("solana",this.store),
                     this.store,
                     true,
                     watched,
@@ -74,9 +73,8 @@ export class Scanner {
                 );
               } else if (pools[0].chain === "base" || pools[0].chain === "bsc") {
                 const chain = pools[0].chain;
-                const { evmNetworks } = await import("../adapters/evm-liquidity");
                 const { enrichEvmDepth } = await import("../adapters/evm-depth");
-                const depthRpc = new ReadOnlyRpc((chain === "base" ? env.BASE_DEPTH_RPC_URL : env.BSC_RPC_URL) ?? evmNetworks[chain].url);
+                const depthRpc = new RpcRouter(chain,this.store);
                 notes.push(await enrichEvmDepth(pools, depthRpc, this.store, true, watched));
                 for (const pool of pools) {
                   const saved = this.store.latestFeeWindows(pool.id, pool.timestamp);
@@ -141,11 +139,13 @@ export class Scanner {
       .where(eq(runs.id, id))
       .run();
     this.store.prune(env.RETENTION_DAYS);
-    this.store.saveScanMetrics(id, Date.now() - startedAt, traffic.apiRequests, traffic.rpcRequests, traffic.cacheHits);
+    const durationMs = Date.now() - startedAt;
+    this.store.saveScanMetrics(id, durationMs, traffic.apiRequests, traffic.rpcRequests, traffic.cacheHits);
+    if (durationMs > 25000) log.warn({run:id,durationMs},"Foreground scan exceeded 25 seconds");
     log.info(
       {
         run: id,
-        durationMs: Date.now() - startedAt,
+        durationMs,
         sources: result.map((r) => ({ source: r.name, status: r.status, pools: r.pools })),
       },
       "Scan complete",

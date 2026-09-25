@@ -448,6 +448,7 @@ export function expireLiquidity<T extends Snapshot>(data: T, now: number): T {
           depth5PctUsd: null,
           depth10PctUsd: null,
           depthConfidence: "UNAVAILABLE" as const,
+          depthState: "STALE" as const,
         }
       : {}),
   };

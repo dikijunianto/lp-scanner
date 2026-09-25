@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { signalEvidenceConfidence, type CohortFact } from "../core/cohorts";
 import type { Pool, Snapshot, FeeWindow, Window, PriceRecord } from "../core/model";
 import { windows, windowMs } from "../core/model";
 import {
@@ -116,6 +117,10 @@ export function createResearchStore(sqlite: Database.Database) {
           (r) => r.pool_id,
         ),
       );
+    },
+    activeSignalIds(): Set<string> {
+      return new Set((sqlite.prepare("SELECT DISTINCT pool_id FROM signal_episodes WHERE episode_end IS NULL").all() as {pool_id:string}[])
+        .map((r) => r.pool_id));
     },
     watch(poolId: string, watched: boolean) {
       if (!sqlite.prepare("SELECT id FROM pools WHERE id=?").get(poolId)) return false;
@@ -489,13 +494,17 @@ export function createResearchStore(sqlite: Database.Database) {
       ).map(signal);
     },
     researchFacts(limit = 5000) {
-      return sqlite
+      const rows = sqlite
         .prepare(
           `SELECT s.id,s.signal_type signalType,s.episode_start episodeStart,
         json_extract(s.data,'$.pool.chain') chain,json_extract(s.data,'$.pool.protocol') protocol,
         json_extract(s.data,'$.pool.pair') pair,json_extract(s.data,'$.pool.tokenAge') tokenAge,
         json_extract(s.data,'$.pool.poolAge') poolAge,json_extract(s.data,'$.metrics.activity') activity,
         json_extract(s.data,'$.metrics.risk') risk,json_extract(s.data,'$.metrics.dataQuality') confidence,
+        json_extract(s.data,'$.metrics.feeConfidence') feeConfidence,
+        json_extract(s.data,'$.metrics.liquidityConfidence') liquidityConfidence,
+        json_extract(s.data,'$.metrics.priceConfidence') priceConfidence,
+        json_extract(s.data,'$.pool.depthConfidence') depthConfidence,
         json_extract(s.data,'$.metrics.feeEfficiency1h') feeEfficiency,
         json_extract(s.data,'$.metrics.volumeDepthRatio1h') volumeDepth,
         json_extract(s.data,'$.pool.realizedVolatility1h') volatility,
@@ -505,7 +514,12 @@ export function createResearchStore(sqlite: Database.Database) {
         WHERE s.id IN (SELECT id FROM signal_episodes ORDER BY episode_start DESC LIMIT ?)
         ORDER BY s.episode_start DESC,o.due_at`,
         )
-        .all(limit) as Record<string, unknown>[];
+        .all(limit) as (CohortFact & {feeConfidence:string;liquidityConfidence:string;
+          priceConfidence:string;depthConfidence:string})[];
+      return rows.map(({feeConfidence,liquidityConfidence,priceConfidence,depthConfidence,...row}) => ({
+        ...row,confidence:signalEvidenceConfidence(row.signalType,row.confidence,
+          feeConfidence,liquidityConfidence,priceConfidence,depthConfidence),
+      }));
     },
     signalDetail(id: number): { signal: SignalRow; outcomes: OutcomeRow[] } | null {
       const row = sqlite.prepare("SELECT * FROM signal_episodes WHERE id=?").get(id) as
@@ -549,6 +563,7 @@ export function createResearchStore(sqlite: Database.Database) {
           AND json_extract(data,'$.pool.token0.usdPriceSourceTimestamp') IS NOT NULL AND json_extract(data,'$.pool.token1.usdPriceSourceTimestamp') IS NOT NULL) price_timestamped,
         SUM(json_extract(data,'$.metrics.priceConfidence') IN ('HIGH','MEDIUM')) price_reliable,
         SUM(json_extract(data,'$.pool.feeWindows.1h.methodology')='EVENT_DERIVED' OR (chain='solana' AND json_extract(data,'$.pool.fees1h') IS NOT NULL)) fee_1h,
+        SUM(json_extract(data,'$.pool.feeWindows.4h.methodology')='EVENT_DERIVED' OR (chain='solana' AND json_extract(data,'$.pool.fees4h') IS NOT NULL)) fee_4h,
         SUM(json_extract(data,'$.pool.depth5PctUsd') IS NOT NULL) depth,
         SUM(json_extract(data,'$.metrics.dataQuality')='HIGH') high_confidence
         FROM pools WHERE updated_at >= COALESCE((SELECT started_at FROM scanner_runs WHERE ended_at IS NOT NULL AND status!='error' ORDER BY id DESC LIMIT 1),0)

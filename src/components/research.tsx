@@ -1,10 +1,12 @@
 "use client";
 import Link from "next/link";
 import { useMemo, useState } from "react";
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { useData } from "./use-data";
 import { usd, efficiency, multiple } from "./format";
 import type { Snapshot } from "@/core/model";
 import type { Outcome, Horizon } from "@/core/research";
+import type { CohortAggregate } from "@/core/cohorts";
 
 const when = (time: number | null) => (time ? new Date(time).toLocaleString() : "—");
 const pct = (n: number | null | undefined) => (n == null ? "—" : `${(n * 100).toFixed(1)}%`);
@@ -22,6 +24,7 @@ const pageNav = (
     <Link href="/research/signals">Signals</Link>
     <Link href="/research/summary">Summary</Link>
     <Link href="/research/coverage">Data quality</Link>
+    <Link href="/diagnostics/data-health">Data health</Link>
   </nav>
 );
 interface SignalBrief {
@@ -355,11 +358,12 @@ const bucket = (value: number | null, kind: "fee" | "depth" | "vol") =>
             ? "medium"
             : "high";
 export function ResearchSummary() {
-  const { data, error } = useData<{ facts: Fact[] }>("/api/research/summary", 60000);
+  const { data, error } = useData<{ facts: Fact[]; cohorts: CohortAggregate[]; minSample: number;
+    counts: {signals:number;completeOutcomes:number}; outcomes: {horizon:string;status:string;n:number}[] }>("/api/research/summary", 60000);
   const [chain, setChain] = useState("all"),
     [protocol, setProtocol] = useState("all"),
     [kind, setKind] = useState("all"),
-    [confidence, setConfidence] = useState("all"),
+    [confidence, setConfidence] = useState("HIGH_MEDIUM"),
     [trend, setTrend] = useState("all"),
     [pair, setPair] = useState("");
   const [minActivity, setMinActivity] = useState(""),
@@ -378,7 +382,8 @@ export function ResearchSummary() {
           (chain === "all" || f.chain === chain) &&
           (protocol === "all" || f.protocol === protocol) &&
           (kind === "all" || f.signalType === kind) &&
-          (confidence === "all" || f.confidence === confidence) &&
+          (confidence === "ALL" || (confidence === "HIGH_MEDIUM" ?
+            ["HIGH","MEDIUM"].includes(f.confidence) : f.confidence === "HIGH")) &&
           (trend === "all" || f.trend === trend) &&
           f.pair.toLowerCase().includes(pair.toLowerCase()) &&
           (minActivity === "" || (f.activity != null && f.activity >= Number(minActivity))) &&
@@ -424,15 +429,16 @@ export function ResearchSummary() {
   const render = (rows: Fact[], label: string, count: number) => {
     const one = outcome(rows, "1h"),
       four = outcome(rows, "4h");
+    const enough = one.length >= (data?.minSample ?? 30);
     return (
       <tr key={label}>
         <td>{label.replaceAll("_", " ")}</td>
         <td>{count}</td>
         <td>{one.length}</td>
-        <td>{pct(median(one.map((o) => o.feePersistence)))}</td>
-        <td>{pct(median(four.map((o) => o.activityPersistence)))}</td>
+        <td>{enough ? pct(median(one.map((o) => o.feePersistence))) : "INSUFFICIENT SAMPLE"}</td>
+        <td>{four.length >= (data?.minSample ?? 30) ? pct(median(four.map((o) => o.activityPersistence))) : "INSUFFICIENT SAMPLE"}</td>
         <td>
-          {pct(
+          {four.length >= (data?.minSample ?? 30) ? pct(
             median(
               four.map((o) =>
                 o.ranges["5"].timeSpentInRangePct == null
@@ -440,12 +446,19 @@ export function ResearchSummary() {
                   : o.ranges["5"].timeSpentInRangePct! / 100,
               ),
             ),
-          )}
+          ) : "INSUFFICIENT SAMPLE"}
         </td>
-        <td>{pct(median(four.map((o) => o.maxPriceMoveDown)))}</td>
+        <td>{four.length >= (data?.minSample ?? 30) ? pct(median(four.map((o) => o.maxPriceMoveDown))) : "INSUFFICIENT SAMPLE"}</td>
       </tr>
     );
   };
+  const curve = (data?.cohorts ?? []).filter((c) => c.confidenceFilter === confidence &&
+    c.dimension === "all" && c.status === "VALID" && (kind === "all" || c.signalType === kind))
+    .sort((a,b) => b.outcomeCounts["1h"]-a.outcomeCounts["1h"])[0];
+  const curveRows = curve ? [{horizon:"0",activity:1,range2_5:1,range5:1,range10:1},
+    ...curve.curves.map((c) => ({horizon:c.horizon,activity:c.activityRatio.median,
+      range2_5:c.ranges["2.5"].survivalRate,range5:c.ranges["5"].survivalRate,
+      range10:c.ranges["10"].survivalRate}))] : [];
   return (
     <>
       <div className="eyebrow">DESCRIPTIVE HISTORICAL ANALYSIS</div>
@@ -460,6 +473,12 @@ export function ResearchSummary() {
           {error}
         </div>
       )}
+      <section className="stats">
+        <Mini label="TOTAL SIGNALS" value={String(data?.counts.signals ?? "—")} />
+        <Mini label="COMPLETED OUTCOMES" value={String(data?.counts.completeOutcomes ?? "—")} />
+        {(["30m","1h","4h","24h"] as const).map((h) => <Mini key={h} label={`${h.toUpperCase()} OUTCOMES`}
+          value={String(data?.outcomes.find((o) => o.horizon === h && o.status === "COMPLETE")?.n ?? 0)} />)}
+      </section>
       <section className="panel">
         <div className="research-filters">
           <label>
@@ -492,10 +511,9 @@ export function ResearchSummary() {
           <label>
             CONFIDENCE
             <select value={confidence} onChange={(e) => setConfidence(e.target.value)}>
-              <option value="all">All</option>
-              {["HIGH", "MEDIUM", "LOW", "UNAVAILABLE"].map((x) => (
-                <option key={x}>{x}</option>
-              ))}
+              <option value="HIGH_MEDIUM">High + medium</option>
+              <option value="HIGH">High only</option>
+              <option value="ALL">All</option>
             </select>
           </label>
           <label>
@@ -553,6 +571,7 @@ export function ResearchSummary() {
       </section>
       <section className="panel">
         <div className="eyebrow">MATCHED COHORT</div>
+        <p>Minimum {data?.minSample ?? 30} complete outcomes per statistic. Confidence composition follows selected filter.</p>
         <div className="table-scroll">
           <table>
             <thead>
@@ -576,6 +595,45 @@ export function ResearchSummary() {
           Percentages describe saved observations, not LP returns. At most the latest 5,000 signal
           episodes appear; missing outcomes are excluded from each median and counts remain visible.
         </p>
+      </section>
+      <section className="panel">
+        <div className="eyebrow">PERSISTED COHORT VALIDATION · HISTORICAL OBSERVATIONS</div>
+        <p>Grouped by signal, chain, protocol, trend, risk, activity, volatility, confidence, token age, and pool age. Filters other than signal and confidence apply only to the matched cohort above.</p>
+        <div className="table-scroll"><table><thead><tr>
+          <th>SIGNAL</th><th>GROUP</th><th>1H N</th><th>CONFIDENCE H/M/L/U</th><th>1H ACTIVITY</th><th>1H ±5% SURVIVAL</th><th>4H ±5% SURVIVAL</th>
+        </tr></thead><tbody>
+          {(data?.cohorts ?? []).filter((c) => c.confidenceFilter === confidence &&
+            (kind === "all" || c.signalType === kind))
+            .sort((a,b) => b.outcomeCounts["1h"]-a.outcomeCounts["1h"]).slice(0,30).map((c) => {
+              const one = c.curves.find((x) => x.horizon === "1h")!, four = c.curves.find((x) => x.horizon === "4h")!;
+              return <tr key={c.key}><td>{c.signalType.replaceAll("_"," ")}</td>
+                <td>{c.dimension}: {c.value}</td><td>{c.outcomeCounts["1h"]}</td>
+                <td>{["HIGH","MEDIUM","LOW","UNAVAILABLE"].map((x) => c.confidenceComposition[x] ?? 0).join("/")}</td>
+                <td>{one.activityPersistence.median == null ? "INSUFFICIENT SAMPLE" : pct(one.activityPersistence.median)}</td>
+                <td>{one.ranges["5"].survivalRate == null ? "INSUFFICIENT SAMPLE" : pct(one.ranges["5"].survivalRate)}</td>
+                <td>{four.ranges["5"].survivalRate == null ? "INSUFFICIENT SAMPLE" : pct(four.ranges["5"].survivalRate)}</td></tr>;
+            })}
+        </tbody></table></div>
+      </section>
+      <section className="panel"><div className="eyebrow">HISTORICAL RANGE SURVIVAL</div>
+        <p>{curve ? `${curve.signalType.replaceAll("_"," ")} · ${curve.outcomeCounts["1h"]} complete 1h outcomes` :
+          `INSUFFICIENT SAMPLE · minimum ${data?.minSample ?? 30} complete 1h outcomes`}</p>
+        {curve && <div style={{width:"100%",height:250}}><ResponsiveContainer>
+          <LineChart data={curveRows}><CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="horizon" /><YAxis domain={[0,1]} tickFormatter={(x:number)=>`${Math.round(x*100)}%`} />
+            <Tooltip formatter={(x)=>x == null ? "unavailable" : `${(Number(x)*100).toFixed(1)}%`} />
+            <Legend /><Line dataKey="range2_5" name="±2.5%" stroke="#72a5ff" connectNulls={false} />
+            <Line dataKey="range5" name="±5%" stroke="#56c6a9" connectNulls={false} />
+            <Line dataKey="range10" name="±10%" stroke="#f4b45f" connectNulls={false} />
+          </LineChart></ResponsiveContainer></div>}
+      </section>
+      <section className="panel"><div className="eyebrow">SIGNAL ACTIVITY DECAY</div>
+        <p>Median endpoint activity divided by activity at signal creation. Missing endpoints remain gaps.</p>
+        {curve && <div style={{width:"100%",height:220}}><ResponsiveContainer>
+          <LineChart data={curveRows}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="horizon" />
+            <YAxis domain={[0,"auto"]} /><Tooltip /><Line dataKey="activity" name="Normalized activity" stroke="#56c6a9" connectNulls={false} />
+          </LineChart></ResponsiveContainer></div>}
+        {!curve && <p>INSUFFICIENT SAMPLE</p>}
       </section>
     </>
   );

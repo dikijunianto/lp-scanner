@@ -9,6 +9,7 @@ import { and, asc, desc, eq, gte, lt, lte, or } from "drizzle-orm";
 import * as schema from "./schema";
 import { env } from "../config/env";
 import { createResearchStore } from "./research";
+import { createReliabilityStore } from "./reliability";
 import type { Snapshot, Candle, PriceRecord, FeeWindow, Window, Confidence } from "../core/model";
 export interface FeeEventRow {
   poolId: string;
@@ -43,6 +44,8 @@ export interface DepthRow {
   updatedAt: number;
   blockId: string;
   stateKey: string;
+  priceAtCalculation?: number | null;
+  methodologyVersion?: string;
 }
 export function hydrateSnapshot(data: Snapshot): Snapshot {
   return {
@@ -88,16 +91,19 @@ export function createStore(path = env.DATABASE_PATH) {
   }
   const db = drizzle(sqlite, { schema });
   const research = createResearchStore(sqlite);
+  const reliability = createReliabilityStore(sqlite);
   return {
     ...research,
+    ...reliability,
     db,
     close: () => sqlite.close(),
     savePrices(records: PriceRecord[]) {
       const insert = sqlite.prepare(`INSERT INTO price_observations
-        (chain, asset_address, symbol, price_usd, source, source_timestamp, observed_at, block_number, confidence)
-        VALUES (@chain, @assetAddress, @symbol, @priceUsd, @source, @sourceTimestamp, @observedAt, @blockNumber, @confidence)`);
+        (chain, asset_address, symbol, price_usd, source, source_timestamp, observed_at, block_number, confidence,resolution,algorithm_version)
+        VALUES (@chain, @assetAddress, @symbol, @priceUsd, @source, @sourceTimestamp, @observedAt, @blockNumber, @confidence,@resolution,@algorithmVersion)`);
       sqlite.transaction(() => {
-        for (const record of records) insert.run(record);
+        for (const record of records) insert.run({ resolution: record.resolution ?? "REALTIME",
+          algorithmVersion: record.algorithmVersion ?? "sprint4-v1", ...record });
       })();
     },
     priceAt(chain: string, address: string, at: number, maxAgeMs: number): PriceRecord | null {
@@ -119,6 +125,8 @@ export function createStore(path = env.DATABASE_PATH) {
             observedAt: Number(row.observed_at),
             blockNumber: row.block_number == null ? null : String(row.block_number),
             confidence: row.confidence as Confidence,
+            resolution: (row.resolution ?? "REALTIME") as PriceRecord["resolution"],
+            algorithmVersion: row.algorithm_version == null ? undefined : String(row.algorithm_version),
           }
         : null;
     },

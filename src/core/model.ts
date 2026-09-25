@@ -20,6 +20,8 @@ export interface PriceRecord {
   observedAt: number;
   blockNumber: string | null;
   confidence: Confidence;
+  resolution?: "REALTIME" | "1M" | "5M" | "HOURLY" | "DAILY";
+  algorithmVersion?: string;
 }
 export interface FeeWindow {
   volumeUsd: Nullable;
@@ -98,6 +100,11 @@ export type Pool = {
   depthSource?: string | null;
   depthUpdatedAt?: Nullable;
   depthExpiresAt?: Nullable;
+  depthBlock?: string | null;
+  depthPriceAtCalculation?: Nullable;
+  depthCurrentPrice?: Nullable;
+  depthPriceDriftPct?: Nullable;
+  depthState?: "CURRENT" | "STALE" | "UNAVAILABLE";
 } & Record<`volume${Window}` | `fees${Window}` | `priceChange${Window}`, Nullable>;
 export interface Candle {
   timestamp: number;

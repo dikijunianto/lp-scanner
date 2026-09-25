@@ -4,7 +4,8 @@ import { env } from "../config/env";
 import { binDepth, type BinBalance } from "../core/depth";
 import type { Pool } from "../core/model";
 import type { Store, DepthRow } from "../db/store";
-import { applyDepth } from "./evm-depth";
+import { applyDepth, depthRefreshMs, depthTargets } from "./evm-depth";
+import { depthDriftPct, dlmmDepthKey } from "../core/depth";
 import { ReadOnlyRpc } from "./liquidity-rpc";
 import { accountsSchema, decodeBinArray, decodePair, PROGRAM } from "./meteora-liquidity";
 
@@ -15,29 +16,29 @@ const { deriveBinArray, binIdToBinArrayIndex, getBinFromBinArray, MAX_BIN_ARRAY_
 const arraySize = MAX_BIN_ARRAY_SIZE.toNumber();
 
 export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Store, cacheOnly = false, watched = new Set<string>()) {
-  const targets = pools
+  const eligible = pools
     .filter(
       (p) =>
         p.activeLiquidityDetails?.method === "DLMM_ACTIVE_BIN_V1" &&
         ["HIGH", "MEDIUM"].includes(p.token0.usdPriceConfidence ?? "UNAVAILABLE") &&
         ["HIGH", "MEDIUM"].includes(p.token1.usdPriceConfidence ?? "UNAVAILABLE"),
-    )
-    .slice(0, env.DEPTH_METEORA_LIMIT);
+    );
+  const active = store.activeSignalIds();
+  const targets = depthTargets(eligible,store,cacheOnly,watched,env.DEPTH_METEORA_LIMIT);
   let enriched = 0,
     cached = 0;
   const reasons = new Map<string, number>();
-  for (const pool of targets) {
+  for (const {pool,old} of targets) {
     const details = pool.activeLiquidityDetails!;
-    const stateKey = `${details.activeBinId}:${Math.round(Math.log(details.price0Usd) * 200)}:${Math.round(
-      Math.log(details.price1Usd) * 200,
-    )}`;
-    const old = store.latestDepth(pool.id);
+    const stateKey = dlmmDepthKey(details.activeBinId!,details.binStep!,
+      details.price0Usd,details.price1Usd);
     if (
       old &&
       old.stateKey === stateKey &&
-      Date.now() - old.updatedAt < env.DEPTH_REFRESH_SECONDS * 1000 * (watched.has(pool.id) ? 0.5 : 1)
+      Date.now() - old.updatedAt < depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)) &&
+      (depthDriftPct(old.priceAtCalculation,pool.price) ?? Infinity) <= env.DEPTH_PRICE_DRIFT_PCT
     ) {
-      applyDepth(pool, old);
+      applyDepth(pool, old, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
       cached++;
       continue;
     }
@@ -107,9 +108,11 @@ export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store:
         updatedAt: Date.now(),
         blockId: String(result.context.slot),
         stateKey,
+        priceAtCalculation: pool.price,
+        methodologyVersion: "sprint5-v2",
       };
       store.saveDepth(pool.id, row);
-      applyDepth(pool, row);
+      applyDepth(pool, row, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
       enriched++;
     } catch (error) {
       const reason = error instanceof Error ? error.message : "RPC error";

@@ -2,7 +2,9 @@ import type { Pool } from "../core/model";
 import { unavailableLiquidity } from "../core/liquidity";
 import { env } from "../config/env";
 import { ReadOnlyRpc } from "./liquidity-rpc";
-export async function enrichLiquidity(pools: Pool[]): Promise<string> {
+import { RpcRouter } from "./rpc-router";
+import type { Store } from "../db/store";
+export async function enrichLiquidity(pools: Pool[], store?: Store): Promise<string> {
   if (!env.ACTIVE_LIQUIDITY_ENABLED) {
     for (const p of pools) unavailableLiquidity(p, "Enrichment disabled");
     return "Active liquidity enrichment disabled";
@@ -14,7 +16,7 @@ export async function enrichLiquidity(pools: Pool[]): Promise<string> {
       const { enrichMeteoraLiquidity, SOLANA_PUBLIC_RPC } = await import("./meteora-liquidity");
       result = await enrichMeteoraLiquidity(
         pools,
-        new ReadOnlyRpc(env.SOLANA_RPC_URL ?? SOLANA_PUBLIC_RPC),
+        store ? new RpcRouter("solana",store) : new ReadOnlyRpc(env.SOLANA_RPC_URL ?? SOLANA_PUBLIC_RPC),
       );
     } else if (pools[0].chain === "base" || pools[0].chain === "bsc") {
       const { enrichEvmLiquidity, evmNetworks } = await import("./evm-liquidity");
@@ -22,7 +24,7 @@ export async function enrichLiquidity(pools: Pool[]): Promise<string> {
       result = await enrichEvmLiquidity(
         pools,
         chain,
-        new ReadOnlyRpc(
+        store ? new RpcRouter(chain,store) : new ReadOnlyRpc(
           (chain === "base" ? env.BASE_RPC_URL : env.BSC_RPC_URL) ?? evmNetworks[chain].url,
         ),
       );

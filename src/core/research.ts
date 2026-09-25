@@ -1,6 +1,6 @@
 import type { Snapshot, Pool, Metrics, Confidence } from "./model";
 
-export const scannerVersion = "4.0.0";
+export const scannerVersion = "5.0.0";
 export const activityScoreVersion = "sprint3-v1";
 export const riskScoreVersion = "sprint3-v1";
 export const signalRuleVersion = "sprint4-v1";
@@ -120,6 +120,7 @@ export interface Outcome {
   maxPriceMoveDown: number | null;
   maxObservedVolatility: number | null;
   activityPersistence: number | null;
+  activityRatioAtEndpoint?: number | null;
   feePersistence: number | null;
   volumePersistence: number | null;
   riskChange: number | null;
@@ -227,6 +228,8 @@ export function evaluateOutcome(
     maxPriceMoveDown: priceMoves.length ? Math.min(...priceMoves) : null,
     maxObservedVolatility: vols.length ? Math.max(...vols) : null,
     activityPersistence: fraction(persistence.map((v) => v.both)),
+    activityRatioAtEndpoint: endpoint && valid(signal.metrics.activity) && signal.metrics.activity > 0 &&
+      valid(endpoint.metrics.activity) ? endpoint.metrics.activity / signal.metrics.activity : null,
     feePersistence: fraction(persistence.map((v) => v.feeOk)),
     volumePersistence: fraction(persistence.map((v) => v.volumeOk)),
     riskChange: endpoint ? endpoint.metrics.risk - signal.metrics.risk : null,

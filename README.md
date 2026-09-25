@@ -84,6 +84,8 @@ Public APIs can be delayed, incomplete or unavailable. Observation timestamps me
 
 Sprint 2 adds active-liquidity provenance to each row and pool detail, plus a **Reliable active liquidity** filter (fresh HIGH/MEDIUM; V3 estimates remain labeled). Sprint 3 adds timestamped independent USD prices, event-derived EVM fee windows, and bounded ±1/2.5/5/10% depth. See [pricing](docs/pricing.md), [fees](docs/fees.md), and [liquidity depth](docs/liquidity-depth.md). Older indexer prices still have unknown publication times and remain explicitly LOW when no independent quote is available.
 
+Sprint 5 adds [RPC provider routing](docs/rpc-providers.md), [historical price backfill](docs/price-backfill.md), [depth freshness rules](docs/depth-coverage.md), [descriptive cohorts](docs/cohort-validation.md), and a [data health page](docs/data-health.md). Open `/diagnostics/data-health` for provider limitations, current versus stored fee coverage, and missing-price reasons. All new tables and columns use additive migration `0005_reliability.sql`.
+
 ## Metric definitions
 
 - **TVL:** total USD liquidity reported by the provider, including inactive liquidity.
