@@ -1,0 +1,7 @@
+# Background depth service
+
+Depth reconstruction runs only in its background process. Watched and active-signal pools rank ahead of other HOT pools, then WARM and COLD. The service reads V3 tick bitmap words and initialized ticks at the pool's recorded block; Meteora reads the pair and bin arrays at a confirmed slot. It calculates bounded ±1%, ±2.5%, ±5%, and ±10% values, but treats ±5% as the coverage requirement. A failed read leaves depth unavailable; it never substitutes total TVL or unverified current state.
+
+V3 bitmap and `liquidityNet` reconstruction is cached by pool, state key, and exact block for two minutes. Tick/liquidity/price changes, a new block, or TTL expiry invalidate reuse. Saved final depth also expires according to pool priority and price drift. The V3 primary method uses Multicall3 for bitmap and tick reads. If Multicall3 fails, at most 64 direct `eth_call` reads are attempted at the same block. Tick Lens, indexer, and subgraph tick feeds are not accepted without a configured, block-verifiable implementation. Meteora bin-array addresses and bin access use the official DLMM SDK.
+
+Depth failure categories in data health identify RPC capability, provider, pool-state, tick-limit, and incomplete-range blocks. BSC historical `eth_call` availability remains an infrastructure constraint. If no same-block tick source exists, the service reports unavailable rather than combining different block states. No wallet or transaction capability exists.

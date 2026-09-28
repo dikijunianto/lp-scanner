@@ -126,6 +126,8 @@ export interface Outcome {
   riskChange: number | null;
   ranges: Record<"2.5" | "5" | "10", RangeOutcome>;
   outcomeCompletenessPct?: number;
+  overallCompletenessPct?: number;
+  fieldCompleteness?: Record<"price"|"range"|"fee"|"depth"|"liquidity", "COMPLETE"|"PARTIAL"|"UNAVAILABLE">;
   missingReasons?: string[];
 }
 
@@ -253,6 +255,19 @@ export function evaluateOutcome(
     result.ranges["2.5"].remainedInRange,result.ranges["5"].remainedInRange,
     result.ranges["10"].remainedInRange].filter((v)=>v!==null).length;
   result.outcomeCompletenessPct=complete*10;
+  const group=(values:(unknown|null|undefined)[],sufficient:boolean)=>sufficient?"COMPLETE" as const:
+    values.some((v)=>v!==null && v!==undefined)?"PARTIAL" as const:"UNAVAILABLE" as const;
+  result.fieldCompleteness={
+    price:group([result.endpointAt,result.priceReturn],enough && result.priceReturn!==null),
+    range:group(Object.values(result.ranges).map((r)=>r.remainedInRange),
+      enough && Object.values(result.ranges).every((r)=>r.remainedInRange!==null)),
+    fee:group([result.feesGenerated,result.volumeGenerated],
+      result.feesGenerated!==null && result.volumeGenerated!==null),
+    depth:group([result.depth5PctChange],result.depth5PctChange!==null),
+    liquidity:group([result.activeLiquidityChange],result.activeLiquidityChange!==null),
+  };
+  result.overallCompletenessPct=Object.values(result.fieldCompleteness).reduce((n,v)=>
+    n+(v==="COMPLETE"?100:v==="PARTIAL"?50:0),0)/5;
   result.missingReasons=outcomeMissingReasons(result);
   return result;
 }

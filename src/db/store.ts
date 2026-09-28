@@ -11,6 +11,7 @@ import { env } from "../config/env";
 import { createResearchStore } from "./research";
 import { createReliabilityStore } from "./reliability";
 import { createLiveRecoveryStore } from "./live-recovery";
+import { createContinuityStore } from "./continuity";
 import type { Snapshot, Candle, PriceRecord, FeeWindow, Window, Confidence } from "../core/model";
 export interface FeeEventRow {
   poolId: string;
@@ -34,6 +35,8 @@ export interface FeeEventRow {
   protocolFeeRaw?: string | null;
   priceConfidence?: Confidence | null;
   sender?: string | null;
+  eventSourceType?: string | null;
+  eventSourceId?: string | null;
 }
 export interface DepthRow {
   depth1PctUsd: number | null;
@@ -94,19 +97,27 @@ export function createStore(path = env.DATABASE_PATH) {
   const research = createResearchStore(sqlite);
   const reliability = createReliabilityStore(sqlite);
   const liveRecovery = createLiveRecoveryStore(sqlite,path);
+  const continuity = createContinuityStore(sqlite,path);
   return {
     ...research,
     ...reliability,
     ...liveRecovery,
+    ...continuity,
     db,
     close: () => sqlite.close(),
     savePrices(records: PriceRecord[]) {
       const insert = sqlite.prepare(`INSERT INTO price_observations
         (chain, asset_address, symbol, price_usd, source, source_timestamp, observed_at, block_number, confidence,resolution,algorithm_version)
         VALUES (@chain, @assetAddress, @symbol, @priceUsd, @source, @sourceTimestamp, @observedAt, @blockNumber, @confidence,@resolution,@algorithmVersion)`);
+      const duplicate=sqlite.prepare(`SELECT 1 FROM price_observations WHERE chain=? AND asset_address=?
+        AND source_timestamp=? AND source=? AND price_usd=? LIMIT 1`);
       sqlite.transaction(() => {
-        for (const record of records) insert.run({ resolution: record.resolution ?? "REALTIME",
-          algorithmVersion: record.algorithmVersion ?? "sprint4-v1", ...record });
+        for (const record of records) {
+          if(record.sourceTimestamp===null || duplicate.get(record.chain,record.assetAddress,
+            record.sourceTimestamp,record.source,record.priceUsd)) continue;
+          insert.run({ resolution: record.resolution ?? "REALTIME",
+            algorithmVersion: record.algorithmVersion ?? "sprint4-v1", ...record });
+        }
       })();
     },
     priceAt(chain: string, address: string, at: number, maxAgeMs: number): PriceRecord | null {
@@ -196,12 +207,12 @@ export function createStore(path = env.DATABASE_PATH) {
       sqlite.transaction(() => {
         const insert = sqlite.prepare(`INSERT OR IGNORE INTO fee_events
           (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence,
-          chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender)
+          chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender,event_source_type,event_source_id)
           VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence,
-          @chain,@poolAddress,@amount0,@amount1,@priceUsd0,@priceUsd1,@grossFeeUsd,@lpFeeUsd,@feeTier,@protocolFeeRaw,@priceConfidence,@sender)`);
+          @chain,@poolAddress,@amount0,@amount1,@priceUsd0,@priceUsd1,@grossFeeUsd,@lpFeeUsd,@feeTier,@protocolFeeRaw,@priceConfidence,@sender,@eventSourceType,@eventSourceId)`);
         for (const event of events) insert.run({ chain: null, poolAddress: null, amount0: null, amount1: null,
           priceUsd0: null, priceUsd1: null, grossFeeUsd: null, lpFeeUsd: null, feeTier: null,
-          protocolFeeRaw: null, priceConfidence: null, sender: null, ...event });
+          protocolFeeRaw: null, priceConfidence: null, sender: null,eventSourceType:null,eventSourceId:null,...event });
         sqlite
           .prepare(
             `INSERT INTO fee_cursors VALUES (?,?,?,?,?,?,?) ON CONFLICT(pool_id)
@@ -246,7 +257,10 @@ export function createStore(path = env.DATABASE_PATH) {
         .prepare("INSERT OR REPLACE INTO depth_observations VALUES (?,?,?,?)")
         .run(poolId, data.blockId, data.updatedAt, JSON.stringify(data));
     },
-    save(items: Snapshot[]) {
+    save(items: Snapshot[],tieredHistory=false) {
+      const watched=tieredHistory?research.watchedIds():new Set<string>();
+      const active=tieredHistory?research.activeSignalIds():new Set<string>();
+      const latest=sqlite.prepare("SELECT timestamp FROM pool_snapshots WHERE pool_id=? ORDER BY timestamp DESC LIMIT 1");
       db.transaction((tx) => {
         for (const data of items) {
           const p = data.pool;
@@ -262,10 +276,14 @@ export function createStore(path = env.DATABASE_PATH) {
             .values(row)
             .onConflictDoUpdate({ target: schema.pools.id, set: row })
             .run();
-          tx.insert(schema.snapshots)
-            .values({ poolId: p.id, timestamp: p.timestamp, data })
-            .onConflictDoNothing()
-            .run();
+          const hot=watched.has(p.id)||active.has(p.id)||data.metrics.surge||
+            (p.volume1h??0)>=env.PRIORITY_TIER1_VOLUME_1H;
+          const last=tieredHistory?(latest.get(p.id) as {timestamp:number}|undefined)?.timestamp:null;
+          if(!tieredHistory || last==null || p.timestamp-last>=(hot?300000:3600000))
+            tx.insert(schema.snapshots)
+              .values({ poolId: p.id, timestamp: p.timestamp, data })
+              .onConflictDoNothing()
+              .run();
           for (const token of [p.token0, p.token1]) {
             const row = {
               id: `${p.chain}:${token.address}`,

@@ -6,12 +6,11 @@ import { env } from "../config/env";
 import { settings } from "../db/schema";
 import { createStore } from "../db/store";
 import { Scanner, log } from "../workers/scanner";
-import { BackgroundWorker } from "../workers/background";
 import { analyze, enrichHistory, simulateRanges } from "../core/analytics";
 import { safeError } from "../adapters/http";
+import { assessReadiness } from "../core/readiness";
 const store = createStore();
 const scanner = new Scanner(store);
-const background = new BackgroundWorker(store);
 for (const [key, value] of Object.entries({
   scanInterval: env.SCAN_INTERVAL_SECONDS,
   retentionDays: env.RETENTION_DAYS,
@@ -41,7 +40,9 @@ app.get("/health", async () => ({
   status: "ok",
   readOnly: true,
   scannerRunning: scanner.running,
-  backgroundRunning: background.running,
+  backgroundRunning: ["outcomes","depth","history"].every((name)=>store.serviceAlive(name)),
+  economicRunning:store.serviceAlive("economic"),
+  liveBaseRunning:store.serviceAlive("live-base"),liveBscRunning:store.serviceAlive("live-bsc"),
   lastRun: store.recentRuns()[0] ?? null,
 }));
 app.get("/pools", async () => ({
@@ -85,9 +86,29 @@ app.get("/research/coverage", async () => ({ coverage: store.coverage(), counts:
     poolId:j.pool_id,chain:j.chain,status:j.status,startBlock:j.start_block,endBlock:j.end_block,
     retryCount:j.retry_count,failureReason:j.failure_reason,
   })) }));
-app.get("/diagnostics/data-health", async () => ({
-  generatedAt: Date.now(),
-  providers: store.rpcProviders(), usage: store.recentRpcUsage(), priceCalls: store.recentPriceCalls(),
+app.get("/diagnostics/data-health", async () => {
+  const generatedAt=Date.now();
+  const providers=store.rpcProviders();
+  const hotCoverage=store.hotCoverage(generatedAt);
+  const snapshotCoverage=store.coreSnapshotCoverage(generatedAt);
+  const scanLatency=store.scanLatency();
+  const outcomeFieldCoverage=store.outcomeFieldCoverage(generatedAt);
+  const recentOutcomeLag=store.recentOutcomeLag(generatedAt);
+  const databaseGrowth=store.databaseGrowth(generatedAt);
+  const storageGrowth=store.storageGrowthSinceVersion(generatedAt);
+  const priorRate=databaseGrowth.rows.reduce((n,r)=>n+r.estimatedBytesPerDay,0);
+  const diskSafety=store.diskSafety(storageGrowth.hours>=24 && storageGrowth.estimatedBytesPerDay!==null
+    ? storageGrowth.estimatedBytesPerDay:priorRate);
+  const eventSources=store.eventSources() as {chain:string;healthState:string}[];
+  const readiness=assessReadiness({foregroundP95Ms:scanLatency.p95Ms,hot:hotCoverage,
+    snapshot:snapshotCoverage,outcomes:outcomeFieldCoverage,
+    outcomeP95LagMs:recentOutcomeLag.p95Ms,providers:[...providers,
+      ...eventSources.map((s)=>({...s,supportsGetLogs:true}))],diskDaysRemaining:diskSafety?.estimatedDaysRemaining??null,
+    growthBytesPerDay:storageGrowth.estimatedBytesPerDay,growthHours:storageGrowth.hours,
+    excludeBsc:env.STRATEGY_BSC_EXCLUDED});
+  return {
+  generatedAt,
+  providers, usage: store.recentRpcUsage(), priceCalls: store.recentPriceCalls(),
   coverage: store.coverage(), currentFees: store.currentFeeCoverage(),
   historicalFees: store.historicalFeeCoverage(), priceBackfill: store.priceBackfillProgress(),
   missingPriceReasons: store.priceReasonCounts(),
@@ -106,8 +127,12 @@ app.get("/diagnostics/data-health", async () => ({
   outcomeMissingness:store.outcomeMissingness(),outcomeLag:store.outcomeCompletionLag(),
   outcomeThroughput:store.outcomeThroughput(),outcomeConcurrency:env.OUTCOME_WORKER_CONCURRENCY,
   depthFailures:store.depthFailureCounts(),bscDepthFailures:store.depthFailureCounts("bsc"),
-  databaseGrowth:store.databaseGrowth(),
-}));
+  databaseGrowth,storageGrowth,hotCoverage,snapshotCoverage,scanLatency,outcomeFieldCoverage,
+  recentOutcomeLag,diskSafety,readiness,datasetVersion:store.datasetVersion(),
+  liveRuns:store.recentLiveRuns(),slowCalls:store.recentSlowCalls(),eventSources,
+  sourceDisagreements:store.sourceDisagreementRates(),
+  };
+});
 app.get("/diagnostics/pool-freshness/:id", async (request,reply) => {
   const {id}=z.object({id:z.string().min(1).max(180)}).parse(request.params);
   return store.poolFreshness(id)??reply.code(404).send({error:"Pool not found"});
@@ -152,7 +177,6 @@ const close = async () => {
   closing = true;
   await app.close();
   await scanner.stop();
-  await background.stop();
   store.close();
 };
 process.on("SIGINT", () => void close());
@@ -160,4 +184,3 @@ process.on("SIGTERM", () => void close());
 await app.listen({ host: "127.0.0.1", port: env.API_PORT });
 log.info({ port: env.API_PORT }, "Read-only API listening");
 scanner.start();
-background.start();
