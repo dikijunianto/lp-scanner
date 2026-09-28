@@ -111,7 +111,7 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.depth5PctUsd') END,
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.realizedVolatility1h') END
         FROM pools p WHERE ${hotWhere}`).run(at,...Array(9).fill(freshAfter),env.PRIORITY_TIER1_VOLUME_1H).changes;
-      })();
+      }).immediate();
     },
     coreHistory(poolId:string,from:number,to:number):CoreSnapshotRow[] {
       return sqlite.prepare(`SELECT pool_id poolId,timestamp,source_updated_at sourceUpdatedAt,
@@ -176,7 +176,7 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
     scanLatency(limit=20) {
       const a=(sqlite.prepare("SELECT duration_ms ms FROM scan_metrics ORDER BY run_id DESC LIMIT ?")
         .all(limit) as {ms:number}[]).map((r)=>r.ms).sort((x,y)=>x-y);
-      const q=(p:number)=>a.length?a[Math.floor((a.length-1)*p)]:null;
+      const q=(p:number)=>a.length?a[Math.ceil(a.length*p)-1]:null;
       return {n:a.length,medianMs:q(.5),p90Ms:q(.9),p95Ms:q(.95),p99Ms:q(.99)};
     },
     recordScanSlowCalls(runId:number,calls:{source:string;durationMs:number;reason:string}[]) {

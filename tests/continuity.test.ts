@@ -16,6 +16,7 @@ import { mkdtempSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import Database from "better-sqlite3";
 
 const address=`0x${"a".repeat(40)}`;
 const hash=(char:string)=>`0x${char.repeat(64)}`;
@@ -31,6 +32,18 @@ const policy:SignalPolicy={feeEfficiency:.001,volumeDepth:1,activity:70,risk:60,
 afterEach(()=>vi.unstubAllGlobals());
 
 describe("Sprint 7 continuity",()=>{
+  it("includes a single severe scan outlier in p99",()=>{
+    const dir=mkdtempSync(join(tmpdir(),"lp-latency-")),path=join(dir,"scanner.sqlite");
+    try {
+      const store=createStore(path),db=new Database(path);
+      try {
+        const run=db.prepare("INSERT INTO scanner_runs(started_at,status,data) VALUES (?,'ok','{}')");
+        const metric=db.prepare("INSERT INTO scan_metrics VALUES (?,?,?,?,?)");
+        for(let i=0;i<20;i++) metric.run(run.run(Date.now()).lastInsertRowid,i===19?486733:1000,0,0,0);
+        expect(store.scanLatency()).toMatchObject({n:20,medianMs:1000,p95Ms:1000,p99Ms:486733});
+      } finally {db.close();store.close();}
+    } finally {rmSync(dir,{recursive:true,force:true});}
+  });
   it("keeps core cadence independent of full snapshot sampling and reports gaps",()=>{
     const store=createStore(":memory:");
     try {
