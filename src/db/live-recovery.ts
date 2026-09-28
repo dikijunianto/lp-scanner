@@ -22,12 +22,12 @@ export function createLiveRecoveryStore(sqlite: Database.Database, databasePath:
       sqlite.transaction(() => {
         const insert = sqlite.prepare(`INSERT OR IGNORE INTO fee_events
           (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence,
-          chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender)
+          chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender,event_source_type,event_source_id)
           VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence,
-          @chain,@poolAddress,@amount0,@amount1,@priceUsd0,@priceUsd1,@grossFeeUsd,@lpFeeUsd,@feeTier,@protocolFeeRaw,@priceConfidence,@sender)`);
+          @chain,@poolAddress,@amount0,@amount1,@priceUsd0,@priceUsd1,@grossFeeUsd,@lpFeeUsd,@feeTier,@protocolFeeRaw,@priceConfidence,@sender,@eventSourceType,@eventSourceId)`);
         for (const event of events) insert.run({poolAddress:null,amount0:null,amount1:null,
           priceUsd0:null,priceUsd1:null,grossFeeUsd:null,lpFeeUsd:null,feeTier:null,
-          protocolFeeRaw:null,priceConfidence:null,sender:null,...event});
+          protocolFeeRaw:null,priceConfidence:null,sender:null,eventSourceType:null,eventSourceId:null,...event});
         sqlite.prepare(`INSERT INTO live_fee_cursors VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(pool_id) DO UPDATE SET block_number=excluded.block_number,
           block_hash=excluded.block_hash,end_time=excluded.end_time,head_block=excluded.head_block,

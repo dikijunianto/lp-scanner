@@ -4,6 +4,7 @@ import type { Pool, Snapshot, FeeWindow, Window, PriceRecord } from "../core/mod
 import { windows, windowMs } from "../core/model";
 import { priorityPolicy } from "../config/env";
 import { freshness } from "../core/freshness";
+import type { CoreSnapshotRow } from "./continuity";
 import {
   detectSignals,
   evaluateOutcome,
@@ -127,9 +128,17 @@ export function createResearchStore(sqlite: Database.Database) {
     },
     watch(poolId: string, watched: boolean) {
       if (!sqlite.prepare("SELECT id FROM pools WHERE id=?").get(poolId)) return false;
-      if (watched)
-        sqlite.prepare("INSERT OR IGNORE INTO watchlist VALUES (?,?)").run(poolId, Date.now());
-      else sqlite.prepare("DELETE FROM watchlist WHERE pool_id=?").run(poolId);
+      sqlite.transaction(()=>{
+        if (watched) {
+          const at=Date.now();
+          const added=sqlite.prepare("INSERT OR IGNORE INTO watchlist VALUES (?,?)").run(poolId,at);
+          if(added.changes) sqlite.prepare("INSERT INTO watchlist_history VALUES (?,?,NULL)").run(poolId,at);
+        } else {
+          sqlite.prepare("DELETE FROM watchlist WHERE pool_id=?").run(poolId);
+          sqlite.prepare("UPDATE watchlist_history SET removed_at=? WHERE pool_id=? AND removed_at IS NULL")
+            .run(Date.now(),poolId);
+        }
+      })();
       return true;
     },
     enqueueBackfill(pool: Pool, priority: number) {
@@ -464,6 +473,15 @@ export function createResearchStore(sqlite: Database.Database) {
         },
       }));
     },
+    requeueOutcomeFieldBackfill(limit=20) {
+      return sqlite.prepare(`UPDATE signal_outcomes SET status='READY' WHERE rowid IN
+        (SELECT rowid FROM signal_outcomes WHERE horizon IN ('4h','24h')
+          AND status IN ('PARTIAL','UNAVAILABLE')
+          AND attempts<3
+          AND json_extract(data,'$.fieldCompleteness') IS NULL
+          ORDER BY due_at DESC LIMIT ?)`)
+        .run(limit).changes;
+    },
     completeOutcome(
       signalId: number,
       horizon: Horizon,
@@ -474,17 +492,35 @@ export function createResearchStore(sqlite: Database.Database) {
         .prepare(
           "UPDATE signal_outcomes SET status=?,completed_at=?,data=?,completeness_pct=?,missing_reasons=?,last_error=NULL WHERE signal_id=? AND horizon=? AND status='RUNNING'",
         )
-        .run(status, Date.now(), JSON.stringify(data),data.outcomeCompletenessPct??null,
+        .run(status, Date.now(), JSON.stringify(data),data.overallCompletenessPct??data.outcomeCompletenessPct??null,
           JSON.stringify(data.missingReasons??[]),signalId, horizon);
     },
-    outcomeHistory(poolId: string, from: number, to: number): Snapshot[] {
-      return (
+    outcomeHistory(poolId: string, from: number, to: number, base?:Snapshot): Snapshot[] {
+      const full=(
         sqlite
           .prepare(
             "SELECT data FROM pool_snapshots WHERE pool_id=? AND timestamp>? AND timestamp<=? ORDER BY timestamp",
           )
           .all(poolId, from, to) as { data: string }[]
       ).map((r) => json(r.data));
+      if(!base) return full;
+      const core=sqlite.prepare(`SELECT timestamp,source_updated_at sourceUpdatedAt,price,
+        price_confidence priceConfidence,activity,risk,volume_1h volume1h,fees_1h fees1h,
+        active_liquidity_usd activeLiquidityUsd,depth5_usd depth5Usd,volatility_1h volatility1h
+        FROM core_snapshots WHERE pool_id=? AND timestamp>? AND timestamp<=? AND price IS NOT NULL
+        ORDER BY timestamp`).all(poolId,from,to) as CoreSnapshotRow[];
+      const compact=core.map((r)=>({
+        ...base,
+        pool:{...base.pool,timestamp:r.timestamp,price:r.price,volume1h:r.volume1h,
+          fees1h:r.fees1h,activeLiquidityUsd:r.activeLiquidityUsd,depth5PctUsd:r.depth5Usd,
+          realizedVolatility1h:r.volatility1h},
+        metrics:{...base.metrics,activity:r.activity,risk:r.risk??base.metrics.risk,
+          priceConfidence:r.priceConfidence as Snapshot["metrics"]["priceConfidence"],
+          feeEfficiency1h:null,volumeDepthRatio1h:null},
+      }));
+      const byTime=new Map<number,Snapshot>(compact.map((s)=>[s.pool.timestamp,s]));
+      for(const s of full) byTime.set(s.pool.timestamp,s);
+      return [...byTime.values()].sort((a,b)=>a.pool.timestamp-b.pool.timestamp);
     },
     async evaluateDueOutcomes(policy: SignalPolicy, now = Date.now(), limit = 10, concurrency = 1) {
       sqlite.prepare("UPDATE signal_outcomes SET status='READY' WHERE status='RUNNING' AND started_at<?")
@@ -502,17 +538,22 @@ export function createResearchStore(sqlite: Database.Database) {
           await new Promise<void>((resolve)=>setImmediate(resolve));
           try {
             const end=outcome.dueAt+policy.maxObservationGapMs;
-            const history=this.outcomeHistory(row.poolId,row.episodeStart,end);
+            const history=this.outcomeHistory(row.poolId,row.episodeStart,end,row.data);
             const generated=row.data.pool.chain==="solana" ? {fees:null,volume:null}
               : this.generatedFees(row.poolId,row.episodeStart,outcome.dueAt);
             const data=evaluateOutcome(row.data,history,outcome.horizon,policy,generated);
-            const status=data.endpointAt!==null && data.observationCoveragePct>=80 &&
-              data.priceReturn!==null ? "COMPLETE" : (data.outcomeCompletenessPct??0)>0 ? "PARTIAL" : "UNAVAILABLE";
+            const status=data.fieldCompleteness?.price==="COMPLETE" &&
+              data.fieldCompleteness.range==="COMPLETE" ? "COMPLETE" :
+              (data.overallCompletenessPct??0)>0 ? "PARTIAL" : "UNAVAILABLE";
             this.completeOutcome(row.id,outcome.horizon,status,data);
             completed++;
           } catch(error) {
             const message=error instanceof Error ? error.message : "Outcome evaluation failed";
-            sqlite.prepare(`UPDATE signal_outcomes SET status=CASE WHEN attempts>=3 THEN 'FAILED' ELSE 'READY' END,
+            sqlite.prepare(`UPDATE signal_outcomes SET status=CASE
+              WHEN completed_at IS NOT NULL AND COALESCE(json_extract(data,'$.overallCompletenessPct'),
+                json_extract(data,'$.outcomeCompletenessPct'),0)>0 THEN 'PARTIAL'
+              WHEN completed_at IS NOT NULL THEN 'UNAVAILABLE'
+              WHEN attempts>=3 THEN 'FAILED' ELSE 'READY' END,
               last_error=? WHERE signal_id=? AND horizon=? AND status='RUNNING'`)
               .run(message.slice(0,200),row.id,outcome.horizon);
           }

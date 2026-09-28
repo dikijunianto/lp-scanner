@@ -230,6 +230,8 @@ export function SignalDetail({ id }: { id: number }) {
               <tr>
                 <th>HORIZON</th>
                 <th>STATUS</th>
+                <th>FIELD COVERAGE</th>
+                <th>OVERALL</th>
                 <th>PRICE RETURN</th>
                 <th>FEES GENERATED</th>
                 <th>VOLUME GENERATED</th>
@@ -243,6 +245,9 @@ export function SignalDetail({ id }: { id: number }) {
                 <tr key={o.horizon}>
                   <td>{o.horizon}</td>
                   <td>{o.status}</td>
+                  <td>{o.data?.fieldCompleteness?Object.entries(o.data.fieldCompleteness)
+                    .map(([name,state])=>`${name} ${state.toLowerCase()}`).join(" · "):"Not evaluated"}</td>
+                  <td>{o.data?.overallCompletenessPct==null?"—":`${Math.round(o.data.overallCompletenessPct)}%`}</td>
                   <td>{pct(o.data?.priceReturn)}</td>
                   <td>{usd(o.data?.feesGenerated ?? null)}</td>
                   <td>{usd(o.data?.volumeGenerated ?? null)}</td>

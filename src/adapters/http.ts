@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import { env } from "../config/env";
-import { countApi, countCache } from "../core/traffic";
+import { countApi, countCache, traceSlow } from "../core/traffic";
 export class HttpClient {
   private nextAt = 0;
   private cache = new Map<string, { until: number; data: unknown }>();
@@ -23,6 +23,8 @@ export class HttpClient {
       const wait = Math.max(0, this.nextAt - Date.now());
       this.nextAt = Date.now() + wait + this.spacingMs;
       if (wait) await sleep(wait);
+      const started=Date.now();
+      let reason="OK";
       try {
         countApi();
         const response = await this.fetcher(url, {
@@ -57,10 +59,13 @@ export class HttpClient {
         }
         return data;
       } catch (error) {
+        reason=error instanceof Error?error.name:"ERROR";
         if (error instanceof z.ZodError) throw new Error("Upstream response failed validation");
         if (error instanceof Error && error.message.startsWith("Upstream HTTP")) throw error;
         if (attempt === this.retries) throw new Error("Upstream request failed or timed out");
         await sleep(500 * 2 ** attempt);
+      } finally {
+        traceSlow(new URL(url).hostname,Date.now()-started,reason);
       }
     }
     throw new Error("Upstream retries exhausted");

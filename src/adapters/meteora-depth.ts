@@ -39,6 +39,7 @@ export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store:
       (depthDriftPct(old.priceAtCalculation,pool.price) ?? Infinity) <= env.DEPTH_PRICE_DRIFT_PCT
     ) {
       applyDepth(pool, old, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
+      if(!cacheOnly) store.publishDepth(pool);
       cached++;
       continue;
     }
@@ -113,6 +114,7 @@ export async function enrichMeteoraDepth(pools: Pool[], rpc: ReadOnlyRpc, store:
       };
       store.saveDepth(pool.id, row);
       applyDepth(pool, row, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
+      store.publishDepth(pool);
       enriched++;
     } catch (error) {
       const reason = error instanceof Error ? error.message : "RPC error";

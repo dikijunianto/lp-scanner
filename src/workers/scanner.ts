@@ -1,4 +1,3 @@
-import { enrichLiquidity } from "../adapters/enrich-liquidity";
 import { eq } from "drizzle-orm";
 import pino from "pino";
 import { env, researchPolicy, priorityPolicy } from "../config/env";
@@ -9,14 +8,16 @@ import { windows, type Adapter } from "../core/model";
 import { MeteoraAdapter } from "../adapters/meteora";
 import { UniswapV3Adapter, PancakeV3Adapter } from "../adapters/evm";
 import { safeError } from "../adapters/http";
+import { HttpClient } from "../adapters/http";
+import { applyCachedPrices } from "../adapters/pricing";
 import type { Store } from "../db/store";
 import { runs, type SourceStatus } from "../db/schema";
 import { recordAlert } from "./alerts";
 export const log = pino({ level: env.LOG_LEVEL });
 export const makeAdapters = (): Adapter[] => [
-  new MeteoraAdapter(),
-  new UniswapV3Adapter(),
-  new PancakeV3Adapter(),
+  new MeteoraAdapter(new HttpClient(1000/env.METEORA_REQUESTS_PER_SECOND,fetch,0,2500)),
+  new UniswapV3Adapter(new HttpClient(60000/env.GECKO_REQUESTS_PER_MINUTE,fetch,0,2500)),
+  new PancakeV3Adapter(new HttpClient(60000/env.GECKO_REQUESTS_PER_MINUTE,fetch,0,2500)),
 ];
 export class Scanner {
   private active: Promise<void> | null = null;
@@ -31,7 +32,7 @@ export class Scanner {
   }
   scan() {
     if (this.active) return this.active;
-    const traffic: Traffic = { apiRequests: 0, rpcRequests: 0, cacheHits: 0 };
+    const traffic: Traffic = { apiRequests: 0, rpcRequests: 0, cacheHits: 0,slowCalls:[] };
     this.active = withTraffic(traffic, () => this.execute(traffic)).finally(() => {
       this.active = null;
     });
@@ -50,13 +51,18 @@ export class Scanner {
           const { pools, notes } = await adapter.scan();
           const watched = this.store.watchedIds();
           pools.sort((a, b) => priorityScore(b, watched.has(b.id), undefined, priorityPolicy()) - priorityScore(a, watched.has(a.id), undefined, priorityPolicy()));
-          if (env.ACTIVE_LIQUIDITY_ENABLED && pools.length) {
-            const { enrichPrices } = await import("../adapters/pricing");
-            const priced = await enrichPrices(pools, this.store);
-            this.store.savePrices(priced.records);
-            notes.push(priced.note);
+          notes.push(applyCachedPrices(pools,this.store));
+          for(const pool of pools) {
+            const cached=this.store.get(pool.id)?.pool;
+            if(!cached || cached.activeLiquidityUsd===null) continue;
+            for(const key of ["activeLiquidityUsd","activeLiquiditySource","activeLiquidityConfidence",
+              "activeLiquidityUpdatedAt","activeLiquidityExpiresAt","activeLiquidityReason",
+              "activeLiquidityDetails"] as const) (pool as unknown as Record<string,unknown>)[key]=cached[key];
+            pool.feeTier ??= cached.feeTier;
+            pool.binStep ??= cached.binStep;
+            pool.token0.decimals ??= cached.token0.decimals;
+            pool.token1.decimals ??= cached.token1.decimals;
           }
-          notes.push(await enrichLiquidity(pools,this.store));
           if (env.ACTIVE_LIQUIDITY_ENABLED && pools.length) {
             try {
               const { RpcRouter } = await import("../adapters/rpc-router");
@@ -102,7 +108,7 @@ export class Scanner {
               { surgeMultiplier: env.SURGE_MULTIPLIER, minHourlyFees: env.SURGE_MIN_HOURLY_FEES },
             ),
           );
-          this.store.save(items);
+          this.store.save(items,true);
           for (const item of items) {
             const created = this.store.syncSignals(item, researchPolicy());
             if (created.length) await recordAlert(this.store, item);
@@ -141,6 +147,7 @@ export class Scanner {
     this.store.prune(env.RETENTION_DAYS);
     const durationMs = Date.now() - startedAt;
     this.store.saveScanMetrics(id, durationMs, traffic.apiRequests, traffic.rpcRequests, traffic.cacheHits);
+    this.store.recordScanSlowCalls(id,traffic.slowCalls??[]);
     if (durationMs > 25000) log.warn({run:id,durationMs},"Foreground scan exceeded 25 seconds");
     log.info(
       {

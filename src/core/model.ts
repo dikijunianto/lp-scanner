@@ -36,6 +36,11 @@ export interface FeeWindow {
   endBlock: number | null;
   methodology: "EVENT_DERIVED" | "INDEXER_DERIVED" | "APPROXIMATED" | "UNAVAILABLE";
   confidence: Confidence;
+  coverageStart?:number|null;
+  coverageEnd?:number|null;
+  coveragePct?:number|null;
+  continuityState?:"COMPLETE"|"PARTIAL"|"GAPPED"|"STALE"|"UNAVAILABLE";
+  eventSource?:string|null;
 }
 export interface Token {
   address: string;

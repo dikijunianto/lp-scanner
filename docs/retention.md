@@ -1,0 +1,7 @@
+# Optional retention
+
+`pnpm retention` is a dry run. It prints the next bounded batch (500 rows) and estimated reclaimable bytes. It deletes nothing. `--event-days=N` defaults to 30 and cannot be below 30. `--apply-events` and `--apply-snapshots` are separate, explicit maintenance commands; neither is scheduled or run by the application. Always inspect a dry run and keep a database backup before either apply command. Deleting rows does not reduce the SQLite file until a later manual `VACUUM`.
+
+Raw events become eligible only after the Sprint 7 dataset start, once they are at least N days old, priced, on a completed backfill job, covered by event-derived 5m/30m/1h/4h/24h windows, and outside every signal's ±24-hour research window. Pools with nonterminal outcomes are protected. This is deliberately strict: zero eligible rows is valid. The source cursor and aggregate windows remain. A later raw-event recheck would require restoring from backup.
+
+Full snapshots written after the Sprint 7 dataset start can be thinned after seven days to one per five-minute bucket and after 30 days to one per hourly bucket. The first row in each bucket remains. Watchlist intervals, signal-adjacent ±24-hour periods, and pools with nonterminal outcomes are protected. Existing pre-Sprint-7 history is never selected. Compact core snapshots are not currently pruned. Historical price observations are not bucketed or deleted because their exact source timestamp and provenance matter for swap valuation.

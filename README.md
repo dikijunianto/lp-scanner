@@ -1,5 +1,7 @@
 # Unified LP Scanner
 
+Sprint 7 operations: [live events](docs/live-events.md), [snapshot continuity](docs/snapshot-continuity.md), [storage](docs/storage.md), [retention](docs/retention.md), [depth service](docs/depth-service.md), and [readiness gates](docs/strategy-readiness.md).
+
 A local, read-only concentrated-liquidity monitor for Meteora DLMM (Solana), Uniswap V3 (Base), and PancakeSwap V3 (BSC). It separates observed activity from risk, records historical snapshots, and detects changes against each pool’s own history.
 
 No wallet connection, seed phrase, private key, transaction signing, or movement of funds exists in this application. Zenith is treated as an LP management interface, not a data source. The scanner identifies the supported pool protocols; it does not certify that a particular pool is supported by Zenith.
@@ -15,7 +17,7 @@ pnpm db:migrate
 pnpm dev
 ```
 
-Open **http://localhost:3000**. The API listens only on `127.0.0.1:3001`; the dashboard proxies its read-only GET routes. Both services start with one command. The first scan runs immediately. Subsequent scans start 60 seconds after the prior scan completes, avoiding overlapping work.
+Open **http://localhost:3000**. The API listens only on `127.0.0.1:3001`; the dashboard proxies its read-only GET routes. The API, dashboard, core writer, and isolated background workers start together. The first scan runs immediately. Subsequent scans start 60 seconds after the prior scan completes, avoiding overlapping work.
 
 For continuous operation:
 

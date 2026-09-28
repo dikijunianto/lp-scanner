@@ -276,3 +276,22 @@ export async function enrichPrices(
     note: `Prices: ${chosen.size}/${assets.size} timestamped; ${Math.ceil(keys.length / 50)} Llama batches, ${fallbackKeys.length} CoinGecko assets in ${new Set(fallbackKeys.map((k) => assets.get(k)!.pool.chain)).size} batches`,
   };
 }
+
+// Foreground reads price evidence already saved by the independent economic worker.
+export function applyCachedPrices(pools:Pool[],store:Store) {
+  const cached=new Map<string,PriceRecord|null>();
+  let applied=0;
+  for(const pool of pools) for(const token of [pool.token0,pool.token1]) {
+    token.usdPriceConfidence=token.usdPrice===null?"UNAVAILABLE":"LOW";
+    const key=keyFor(pool,token);
+    if(!cached.has(key)) cached.set(key,store.latestIndependentPrice(pool.chain,token.address));
+    const record=cached.get(key);
+    if(!record) continue;
+    const confidence=priceConfidence(record.sourceTimestamp,record.observedAt,Date.now(),
+      policyFor(token,record.priceUsd));
+    if(confidence!=="HIGH" && confidence!=="MEDIUM") continue;
+    applyPrice(token,{...record,confidence},pool,pricePolicy());
+    applied++;
+  }
+  return `Cached prices: ${applied} token observations`;
+}

@@ -6,13 +6,23 @@ import { priorityPolicy } from "../config/env";
 import type { Pool } from "../core/model";
 import type { Store, DepthRow } from "../db/store";
 import { readContracts } from "./evm-liquidity";
-import { ReadOnlyRpc, words } from "./liquidity-rpc";
+import { ReadOnlyRpc, blockSchema, words } from "./liquidity-rpc";
 
 const abi = new Interface([
   "function tickBitmap(int16) view returns (uint256)",
   "function ticks(int24) view returns (uint128,int128,uint256,uint256,int56,uint160,uint32,bool)",
 ]);
 const wordOf = (tick: number, spacing: number) => Math.floor(Math.floor(tick / spacing) / 256);
+export async function readDepthContracts(rpc:ReadOnlyRpc,calls:{to:string;data:string}[],block:string) {
+  try {return {values:await readContracts(rpc,calls,block),method:"TICK_BITMAP" as const};}
+  catch(error) {
+    if(calls.length>64) throw error;
+    const values:unknown[]=[];
+    for(let i=0;i<calls.length;i+=10)
+      values.push(...await rpc.batch(calls.slice(i,i+10).map((call)=>({method:"eth_call",params:[call,block]}))));
+    return {values,method:"ONCHAIN_DIRECT" as const};
+  }
+}
 export function applyDepth(pool: Pool, row: DepthRow, ttlMs = env.DEPTH_REFRESH_SECONDS * 1000) {
   const drift = depthDriftPct(row.priceAtCalculation,pool.price);
   const stale = drift === null || drift > env.DEPTH_PRICE_DRIFT_PCT;
@@ -79,11 +89,16 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
       (depthDriftPct(old.priceAtCalculation,pool.price) ?? Infinity) <= env.DEPTH_PRICE_DRIFT_PCT
     ) {
       applyDepth(pool, old, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
+      if(!cacheOnly) store.publishDepth(pool);
       cached++;
       continue;
     }
     if (cacheOnly) continue;
     try {
+      if(Date.now()-details.blockTime>env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS*1000)
+        throw new Error("Stale depth pool state");
+      const anchor=blockSchema.parse(await rpc.call("eth_getBlockByNumber",[details.block,false]));
+      if(anchor.number.toLowerCase()!==details.block.toLowerCase()) throw new Error("Depth block identity mismatch");
       const spacing = details.tickSpacing!,
         tick = details.tick!;
       const lowerTick = Math.max(-887272, tick + Math.floor(Math.log(0.95) / Math.log(1.0001)) - 3);
@@ -99,38 +114,46 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
         continue;
       }
       const positions = Array.from({ length: lastWord - firstWord + 1 }, (_, i) => firstWord + i);
-      const rawBitmap = await readContracts(
-        rpc,
-        positions.map((pos) => ({
-          to: pool.poolAddress,
-          data: abi.encodeFunctionData("tickBitmap", [pos]),
-        })),
-        details.block,
-      );
-      const ticks: number[] = [];
-      for (let i = 0; i < positions.length; i++) {
-        const bits = words(rawBitmap[i], 1)[0];
-        for (let b = 0; b < 256; b++)
-          if (((bits >> BigInt(b)) & 1n) === 1n) {
-            const t = (positions[i] * 256 + b) * spacing;
-            if (t >= lowerTick && t <= upperTick) ticks.push(t);
-          }
+      const cachedReconstruction=store.depthReconstruction(pool.id,stateKey,details.block) as
+        {nets:TickNet[];method?:"TICK_BITMAP"|"ONCHAIN_DIRECT";blockHash?:string}|null;
+      let nets=cachedReconstruction?.blockHash?.toLowerCase()===anchor.hash.toLowerCase()
+        ?cachedReconstruction.nets:undefined;
+      let method=nets?cachedReconstruction?.method??"TICK_BITMAP":"TICK_BITMAP";
+      if(!nets) {
+        const bitmap = await readDepthContracts(rpc,positions.map((pos) => ({
+          to:pool.poolAddress,data:abi.encodeFunctionData("tickBitmap",[pos]),
+        })),details.block);
+        const rawBitmap=bitmap.values;
+        if(bitmap.method==="ONCHAIN_DIRECT") method="ONCHAIN_DIRECT";
+        const ticks: number[] = [];
+        for (let i = 0; i < positions.length; i++) {
+          const bits = words(rawBitmap[i], 1)[0];
+          for (let b = 0; b < 256; b++)
+            if (((bits >> BigInt(b)) & 1n) === 1n) {
+              const t = (positions[i] * 256 + b) * spacing;
+              if (t >= lowerTick && t <= upperTick) ticks.push(t);
+            }
+        }
+        if (ticks.length > env.DEPTH_MAX_INITIALIZED_TICKS) {
+          reasons.set("initialized tick cap", (reasons.get("initialized tick cap") ?? 0) + 1);
+          store.recordDepthFailure(pool.id,"initialized tick cap");
+          continue;
+        }
+        const tickRead = await readDepthContracts(rpc,ticks.map((t) => ({
+          to:pool.poolAddress,data:abi.encodeFunctionData("ticks",[t]),
+        })),details.block);
+        const rawTicks=tickRead.values;
+        if(tickRead.method==="ONCHAIN_DIRECT") method="ONCHAIN_DIRECT";
+        nets=ticks.map((t, i) => {
+          const state = words(rawTicks[i], 8);
+          if (state[0] === 0n || state[7] !== 1n) throw new Error("Invalid initialized tick");
+          return { tick: t, liquidityNet: BigInt.asIntN(128, state[1]).toString() };
+        });
+        store.cacheDepthReconstruction(pool.id,stateKey,details.block,
+          {positions,rawBitmap,nets,method,blockHash:anchor.hash});
       }
-      if (ticks.length > env.DEPTH_MAX_INITIALIZED_TICKS) {
-        reasons.set("initialized tick cap", (reasons.get("initialized tick cap") ?? 0) + 1);
-        store.recordDepthFailure(pool.id,"initialized tick cap");
-        continue;
-      }
-      const rawTicks = await readContracts(
-        rpc,
-        ticks.map((t) => ({ to: pool.poolAddress, data: abi.encodeFunctionData("ticks", [t]) })),
-        details.block,
-      );
-      const nets: TickNet[] = ticks.map((t, i) => {
-        const state = words(rawTicks[i], 8);
-        if (state[0] === 0n || state[7] !== 1n) throw new Error("Invalid initialized tick");
-        return { tick: t, liquidityNet: BigInt.asIntN(128, state[1]).toString() };
-      });
+      const finalBlock=blockSchema.parse(await rpc.call("eth_getBlockByNumber",[details.block,false]));
+      if(finalBlock.hash.toLowerCase()!==anchor.hash.toLowerCase()) throw new Error("Depth block changed");
       const values = tickDepth(
         nets,
         details.liquidityRaw!,
@@ -150,7 +173,7 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
       const row: DepthRow = {
         ...values,
         confidence: "MEDIUM",
-        source: "V3_TICK_WALK",
+        source: method==="ONCHAIN_DIRECT"?"V3_DIRECT_TICKS":"V3_TICK_WALK",
         updatedAt: Date.now(),
         blockId: details.block,
         stateKey,
@@ -159,6 +182,7 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
       };
       store.saveDepth(pool.id, row);
       applyDepth(pool, row, depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id)));
+      store.publishDepth(pool);
       enriched++;
     } catch (error) {
       const reason = error instanceof Error ? error.message : "RPC error";

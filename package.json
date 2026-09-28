@@ -8,14 +8,18 @@
   },
   "packageManager": "pnpm@11.19.0",
   "scripts": {
-    "dev": "concurrently -k -n api,web \"tsx watch src/api/server.ts\" \"next dev --hostname 127.0.0.1\"",
+    "predev": "pnpm db:migrate",
+    "dev": "concurrently -k -n api,web,core,outcomes,depth,history,economic,base,bsc \"tsx watch src/api/server.ts\" \"next dev --hostname 127.0.0.1\" \"tsx src/workers/core-writer.ts\" \"tsx src/workers/service.ts outcomes\" \"tsx src/workers/service.ts depth\" \"tsx src/workers/service.ts history\" \"tsx src/workers/service.ts economic\" \"tsx src/workers/service.ts live-base\" \"tsx src/workers/service.ts live-bsc\"",
     "build": "next build",
-    "start": "concurrently -k -n api,web \"tsx src/api/server.ts\" \"next start --hostname 127.0.0.1\"",
+    "prestart": "pnpm db:migrate",
+    "start": "concurrently -k -n api,web,core,outcomes,depth,history,economic,base,bsc \"tsx src/api/server.ts\" \"next start --hostname 127.0.0.1\" \"tsx src/workers/core-writer.ts\" \"tsx src/workers/service.ts outcomes\" \"tsx src/workers/service.ts depth\" \"tsx src/workers/service.ts history\" \"tsx src/workers/service.ts economic\" \"tsx src/workers/service.ts live-base\" \"tsx src/workers/service.ts live-bsc\"",
     "test": "vitest run",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx src/db/migrate.ts",
-    "scanner": "tsx src/workers/cli.ts"
+    "scanner": "tsx src/workers/cli.ts",
+    "retention": "tsx src/workers/retention.ts",
+    "core-writer": "tsx src/workers/core-writer.ts"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

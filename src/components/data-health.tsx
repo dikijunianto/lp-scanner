@@ -8,6 +8,21 @@ type Provider = {providerId:string;chain:string;providerType:string;supportsArch
   errorRate:number;lastSuccessAt:number|null;lastFailureAt:number|null};
 type Row = Record<string, string | number | null>;
 type Health = {generatedAt:number;providers:Provider[];usage:Row[];priceCalls:Row[];coverage:Row[];currentFees:Row[];
+  readiness:{status:string;selectedChains:string[];failed:string[];gates:{id:string;value:number|null;target:number;pass:boolean;excluded?:boolean}[]};
+  hotCoverage:{chain:string;pools:number;priced:number;depth5:number;fee1h:number}[];
+  snapshotCoverage:{tracked:number;maturePools:number;expected:number;actual:number;priced:number;
+    coveragePct:number|null;priceCoveragePct:number|null;largestGapMs:number|null};
+  scanLatency:{n:number;medianMs:number|null;p90Ms:number|null;p95Ms:number|null;p99Ms:number|null};
+  outcomeFieldCoverage:{horizon:string;eligible:number;priceRangeComplete:number}[];
+  recentOutcomeLag:{n:number;p95Ms:number|null};
+  diskSafety:{freeBytes:number;estimatedDaysRemaining:number|null;warning:string}|null;
+  datasetVersion:{version:string}|null;
+  liveRuns:{chain:string;status:string;swaps:number;pools:number;error:string|null}[];
+  slowCalls:{runId:number;source:string;durationMs:number;reason:string}[];
+  eventSources:{sourceId:string;chain:string;sourceType:string;purpose:string;latestIndexedBlock:number|null;
+    latencyMs:number|null;historicalFromBlock:number|null;confidence:string;healthState:string;
+    lastSuccessAt:number|null;lastFailureAt:number|null;error:string|null}[];
+  sourceDisagreements:{chain:string;sourceId:string;compared:number;disagreements:number}[];
   logSources:{chain:string;sourceId:string;sourceType:string;latestIndexedBlock:number|null;
     latencyMs:number|null;historicalCoverage:string;confidence:string;status:string;failureReason:string|null}[];
   historicalFees:Row[];priceBackfill:{total:number;priced:number;pending:number;backfilled:number};
@@ -23,14 +38,16 @@ type Health = {generatedAt:number;providers:Provider[];usage:Row[];priceCalls:Ro
   outcomeThroughput:number;outcomeConcurrency:number;
   bscDepthFailures:{reason:string;n:number;pools:number}[];
   databaseGrowth:{databaseBytes:number;walBytes:number;rows:{name:string;total:number;lastDay:number;
-    estimatedBytesPerDay:number;estimatedBytesPerWeek:number;estimatedBytesPerMonth:number}[]};};
+    estimatedBytesPerDay:number;estimatedBytesPerWeek:number;estimatedBytesPerMonth:number}[]};
+  storageGrowth:{hours:number;estimatedBytesPerDay:number|null;rows:{name:string;count:number;estimatedBytes:number}[]};};
 const yes = (v:boolean|null) => v === null ? "Unknown" : v ? "Yes" : "No";
 const age = (v:number|null, now:number) => v == null ? "Unknown" : `${Math.round((now-v)/60000)} min ago`;
 export function DataHealthPage() {
   const {data,error} = useData<Health>("/api/diagnostics/data-health",30000);
   const alerts:string[] = [];
   for (const chain of ["base","bsc"])
-    if (data && !data.providers.some((p)=>p.chain===chain && p.supportsGetLogs && p.healthState!=="COOLDOWN"))
+    if (data && !data.providers.some((p)=>p.chain===chain && p.supportsGetLogs && p.healthState==="HEALTHY") &&
+      !data.eventSources.some((s)=>s.chain===chain && s.healthState==="HEALTHY"))
       alerts.push(`${chain.toUpperCase()} historical log RPC unavailable`);
   if (data?.scan && data.scan.duration_ms > 25000) alerts.push("Foreground scan exceeded 25 seconds");
   if (data?.oldestJob.oldest && data.generatedAt-data.oldestJob.oldest>3600000)
@@ -57,6 +74,44 @@ export function DataHealthPage() {
       <div className="panel"><div className="eyebrow">FEE JOBS WAITING</div><strong>{data?.counts.queueLength ?? "—"}</strong></div>
       <div className="panel"><div className="eyebrow">OUTCOME LAG</div><strong>{data ? `${Math.round(data.counts.workerLagMs/60000)} min` : "—"}</strong></div>
     </section>
+    <section className="panel"><div className="eyebrow">STRATEGY LAB READINESS · EVALUATION ONLY</div>
+      <h2>{data?.readiness.status??"UNAVAILABLE"}</h2>
+      <p>Selected chains: {data?.readiness.selectedChains.join(", ")??"—"}. No strategy recommendations are generated.</p>
+      <div className="table-scroll"><table><thead><tr><th>GATE</th><th>STATUS</th><th>ACTUAL</th><th>REQUIRED</th></tr></thead><tbody>
+        {(data?.readiness.gates??[]).map((g)=>{
+          const percent=["BASE_LIVE_FEES","BSC_LIVE_FEES","HOT_DEPTH","OUTCOME_4H","OUTCOME_24H"].includes(g.id);
+          const duration=["FOREGROUND_LATENCY","OUTCOME_LATENESS"].includes(g.id);
+          const show=(v:number|null)=>v==null?"—":percent?`${Math.round(v*100)}%`:
+            duration?`${(v/1000).toFixed(1)}s`:g.id==="STORAGE_GROWTH"?`${(v/2**30).toFixed(2)} GiB/day`:
+              g.id==="SNAPSHOT_CONTINUITY"?`${v.toFixed(1)}%`:
+              g.id==="STORAGE_RUNWAY"?`${v.toFixed(0)} days`:String(v);
+          return <tr key={g.id}><td>{g.id.replaceAll("_"," ")}</td><td>{g.excluded?"EXCLUDED":g.pass?"PASS":"FAIL"}</td>
+            <td>{show(g.value)}</td><td>{show(g.target)}</td></tr>;
+        })}</tbody></table></div></section>
+    <section className="panel"><div className="eyebrow">CONTINUOUS CORE SNAPSHOTS</div>
+      <p>{data?.snapshotCoverage.actual??"—"}/{data?.snapshotCoverage.expected??"—"} expected ·
+        {data?.snapshotCoverage.coveragePct==null?" —":` ${data.snapshotCoverage.coveragePct.toFixed(1)}%`} cadence coverage ·
+        {data?.snapshotCoverage.priceCoveragePct==null?" —":` ${data.snapshotCoverage.priceCoveragePct.toFixed(1)}%`} reliable price coverage ·
+        {data?.snapshotCoverage.maturePools??"—"}/{data?.snapshotCoverage.tracked??"—"} mature pools ·
+        largest gap {data?.snapshotCoverage.largestGapMs==null?"—":`${Math.round(data.snapshotCoverage.largestGapMs/60000)} min`}.</p>
+      <p>Foreground scan latency ({data?.scanLatency.n??0} runs): median {data?.scanLatency.medianMs==null?"—":`${(data.scanLatency.medianMs/1000).toFixed(1)}s`} ·
+        p90 {data?.scanLatency.p90Ms==null?"—":`${(data.scanLatency.p90Ms/1000).toFixed(1)}s`} ·
+        p95 {data?.scanLatency.p95Ms==null?"—":`${(data.scanLatency.p95Ms/1000).toFixed(1)}s`} ·
+        p99 {data?.scanLatency.p99Ms==null?"—":`${(data.scanLatency.p99Ms/1000).toFixed(1)}s`}.</p>
+      <p>Slow foreground calls: {(data?.slowCalls??[]).slice(0,5).map((x)=>
+        `${x.source} ${Math.round(x.durationMs)}ms`).join(" · ")||"None recorded"}</p></section>
+    <section className="panel"><div className="eyebrow">NEW STORAGE GROWTH</div>
+      <p>{data?.storageGrowth.estimatedBytesPerDay==null?"Unavailable":
+        `${(data.storageGrowth.estimatedBytesPerDay/2**30).toFixed(2)} GiB/day estimated`}
+        {data?` from ${data.storageGrowth.hours.toFixed(1)} hours of Sprint 7 rows`:""}.
+        Readiness requires at least one hour of samples and less than 0.20 GiB/day.</p></section>
+    <section className="panel"><div className="eyebrow">HOT-POOL CURRENT COVERAGE</div>
+      <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>HOT POOLS</th><th>RELIABLY PRICED</th>
+        <th>±5% DEPTH</th><th>CURRENT 1H FEES</th></tr></thead><tbody>
+        {(data?.hotCoverage??[]).map((r)=><tr key={r.chain}><td>{r.chain}</td><td>{r.pools}</td>
+          <td>{r.priced}</td><td>{r.depth5}</td><td>{r.fee1h}</td></tr>)}</tbody></table></div>
+      <p>Independent live workers: {(data?.liveRuns??[]).map((r)=>
+        `${r.chain} ${r.status}, ${r.swaps} swaps/${r.pools} pools${r.error?` (${r.error})`:""}`).join(" · ")||"Starting"}</p></section>
     <section className="panel"><div className="eyebrow">PIPELINE PRIORITIES</div>
       <p>Live Base cursor: {cursorState("base")} · Live BSC cursor: {cursorState("bsc")} ·
         Outcome queue: {data?.outcomePipeline.some((r)=>(r.oldestReadyAgeMs??0)>1800000)?"CRITICAL":"CURRENT"} ·
@@ -82,8 +137,18 @@ export function DataHealthPage() {
             <td>{lag?`${Math.round(lag.p95Ms/60000)} min`:"—"}</td></tr>})}</tbody></table></div>
       <p>Missing outcomes: {(data?.outcomeMissingness??[]).filter((r)=>r.reason!=="COMPLETE")
         .slice(0,16).map((r)=>`${r.horizon} ${r.reason} ${r.n}`).join(" · ")||"None"}</p></section>
+    <section className="panel"><div className="eyebrow">PRICE / RANGE OUTCOME FIELDS</div>
+      <p>STANDARD-confidence signals with full price and ±2.5%/±5%/±10% range evidence:
+        {(data?.outcomeFieldCoverage??[]).map((r)=>
+          `${r.horizon} ${r.priceRangeComplete}/${r.eligible}`).join(" · ")||" unavailable"}.
+        Recent outcome p95 lateness: {data?.recentOutcomeLag.p95Ms==null?"—":
+          `${Math.round(data.recentOutcomeLag.p95Ms/60000)} min`}.</p></section>
     <section className="panel"><div className="eyebrow">LOG SOURCES</div>
       <p>Historical coverage is unknown until a source proves a requested range. Confidence stays low without recorded independent verification.</p>
+      <p>Configured indexers: {(data?.eventSources??[]).map((s)=>
+        `${s.chain} ${s.purpose} ${s.healthState}, through block ${s.latestIndexedBlock??"unknown"}, ${s.confidence} confidence`).join(" · ")||"None configured"}.
+        Cross-check disagreements: {(data?.sourceDisagreements??[]).map((s)=>
+          `${s.chain} ${s.disagreements}/${s.compared}`).join(" · ")||"No samples"}.</p>
       <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>SOURCE</th><th>TYPE</th>
         <th>LATEST INDEXED BLOCK</th><th>RPC LATENCY</th><th>HISTORY</th><th>CONFIDENCE</th><th>STATUS</th></tr></thead><tbody>
         {(data?.logSources??[]).map((s)=><tr key={s.sourceId}><td>{s.chain}</td><td>{s.sourceId}</td>
@@ -135,6 +200,10 @@ export function DataHealthPage() {
       <p>SQLite {data?`${(data.databaseGrowth.databaseBytes/1073741824).toFixed(2)} GiB`:"—"} ·
         WAL {data?`${(data.databaseGrowth.walBytes/1048576).toFixed(1)} MiB`:"—"}.
         Estimates use recent row counts and sampled row size; no automatic deletion.</p>
+      <p>Disk free {data?.diskSafety?`${(data.diskSafety.freeBytes/1073741824).toFixed(1)} GiB`:"—"} ·
+        projected runway {data?.diskSafety?.estimatedDaysRemaining==null?"—":
+          `${data.diskSafety.estimatedDaysRemaining.toFixed(0)} days`} ·
+        {data?.diskSafety?.warning??"UNAVAILABLE"} · dataset {data?.datasetVersion?.version??"—"}.</p>
       <div className="table-scroll"><table><thead><tr><th>DATA</th><th>ROWS</th><th>LAST DAY</th>
         <th>EST. / DAY</th><th>EST. / WEEK</th><th>EST. / MONTH</th></tr></thead><tbody>
         {(data?.databaseGrowth.rows??[]).map((r)=><tr key={r.name}><td>{r.name}</td><td>{r.total}</td>

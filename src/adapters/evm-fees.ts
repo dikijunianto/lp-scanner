@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { env } from "../config/env";
 import type { Pool, Window, FeeWindow } from "../core/model";
 import { windows, windowMs } from "../core/model";
@@ -8,10 +9,26 @@ import type { Store, FeeEventRow } from "../db/store";
 import type { BackfillJob } from "../db/research";
 import { blockSchema, ReadOnlyRpc } from "./liquidity-rpc";
 import { RpcRouter, isRangeError } from "./rpc-router";
-import { reconcileSwapLogs } from "./log-sources";
+import { fetchIndexedSwaps, reconcileSwapLogs } from "./log-sources";
 type Block = { hash: string; timestamp: number };
 export const liveCursorNeedsRestart = (cursorEndTime:number,updatedAt:number,
   confirmedTime:number,now=Date.now()) => confirmedTime-cursorEndTime>600000 && now-updatedAt>600000;
+export function feeCoveragePct(start:number,end:number,from:number,to:number,
+  gaps:{fromTime:number;toTime:number}[]) {
+  const lower=Math.max(start,from),upper=Math.min(end,to);
+  if(upper<=lower) return 0;
+  let missing=0,coveredUntil=lower;
+  for(const gap of [...gaps].sort((a,b)=>a.fromTime-b.fromTime)) {
+    const a=Math.max(lower,gap.fromTime),b=Math.min(upper,gap.toTime);
+    if(b>Math.max(a,coveredUntil)) missing+=b-Math.max(a,coveredUntil);
+    coveredUntil=Math.max(coveredUntil,b);
+  }
+  return Math.max(0,Math.min(100,(upper-lower-missing)/(end-start)*100));
+}
+export function feeContinuity(coveragePct:number,gapped:boolean,stale:boolean,eventDerived:boolean) {
+  return stale?"STALE":gapped?"GAPPED":eventDerived?"COMPLETE":
+    coveragePct>0?"PARTIAL":"UNAVAILABLE";
+}
 const blockAt = async (rpc: ReadOnlyRpc, n: number): Promise<Block> => {
   const raw = blockSchema.parse(
     await rpc.call("eth_getBlockByNumber", [`0x${n.toString(16)}`, false]),
@@ -27,11 +44,59 @@ export async function readRange(
   store: Store,
   from: number,
   to: number,
+  purpose: "LIVE" | "HISTORICAL" = "HISTORICAL",
 ) {
   const logs: z.infer<typeof swapLogSchema>[] = [];
+  const provenance=new Map<string,{type:string;id:string}>();
+  const rangeSources=new Set<string>();
+  const logKey=(log:z.infer<typeof swapLogSchema>)=>
+    `${log.transactionHash.toLowerCase()}:${Number(BigInt(log.logIndex))}`;
+  const indexerUrl=pool.chain==="base"
+    ? purpose==="LIVE"?env.BASE_LIVE_INDEXER_URL:env.BASE_HISTORICAL_INDEXER_URL
+    : purpose==="LIVE"?env.BSC_LIVE_INDEXER_URL:env.BSC_HISTORICAL_INDEXER_URL;
+  let sourceType="RPC_GET_LOGS",sourceId="DIRECT_RPC",indexedHash:string|null=null;
+  const indexerId=indexerUrl?`${pool.chain}:${createHash("sha256").update(indexerUrl).digest("hex").slice(0,16)}`:null;
+  const indexerStatus=indexerId?(store.eventSources() as {sourceId:string;healthState:string;lastFailureAt:number|null}[])
+    .find((s)=>s.sourceId===indexerId):null;
+  if(indexerUrl && !(indexerStatus?.healthState==="DEGRADED" &&
+    indexerStatus.lastFailureAt && Date.now()-indexerStatus.lastFailureAt<60000)) {
+    const id=indexerId!;
+    const started=Date.now();
+    try {
+      const result=await fetchIndexedSwaps(indexerUrl,pool.chain as "base"|"bsc",pool.poolAddress,from,to);
+      const final=await blockAt(rpc,to);
+      if(final.hash.toLowerCase()!==result.endBlockHash.toLowerCase()) throw new Error("INDEXER_BLOCK_MISMATCH");
+      let verified=false;
+      if(result.logs.length) {
+        const sampleBlock=Number(BigInt(result.logs[0].blockNumber));
+        try {
+          const sample=await rpc.call("eth_getLogs",[{address:pool.poolAddress,
+            fromBlock:`0x${sampleBlock.toString(16)}`,toBlock:`0x${sampleBlock.toString(16)}`,
+            topics:[pool.chain==="bsc"?pancakeSwapTopic:swapTopic]}]);
+          reconcileSwapLogs(result.logs.filter((log)=>Number(BigInt(log.blockNumber))===sampleBlock),sample);
+          store.recordSourceCheck(pool.chain,id,1,0,null);verified=true;
+        } catch(error) {
+          if(error instanceof Error && error.message==="LOG_SOURCE_DISAGREEMENT") {
+            store.recordSourceCheck(pool.chain,id,1,1,error.message);throw error;
+          }
+          store.recordSourceCheck(pool.chain,id,0,0,"RPC sample unavailable");
+        }
+      }
+      logs.push(...result.logs);indexedHash=result.endBlockHash;
+      sourceType="INDEXER";sourceId=result.sourceId;
+      rangeSources.add(`${sourceType}:${sourceId}`);
+      for(const log of result.logs) provenance.set(logKey(log),{type:sourceType,id:sourceId});
+      store.recordEventSource(id,pool.chain,purpose,true,result.latestIndexedBlock,from,
+        result.latencyMs,null,verified);
+    } catch(error) {
+      const reason=error instanceof Error?error.message:"Indexer error";
+      store.recordEventSource(id,pool.chain,purpose,false,null,null,Date.now()-started,reason,false);
+      if(/INDEXER_BLOCK_MISMATCH|LOG_SOURCE_DISAGREEMENT/.test(reason)) throw error;
+    }
+  }
   let range = rpc instanceof RpcRouter ? rpc.safeLogRange : env.FEE_LOG_BLOCK_CHUNK;
   let verified=false;
-  for (let start = from; start <= to;) {
+  for (let start = indexedHash?to+1:from; start <= to;) {
     const size = range;
     const end = Math.min(to, start + size - 1);
     let raw: unknown;
@@ -70,6 +135,13 @@ export async function readRange(
       )
     )
       throw new Error("Malformed log range");
+    if(rpc instanceof RpcRouter) {
+      sourceId=rpc.lastLogSourceId??sourceId;
+      const row=store.rpcProviders().find((p)=>p.providerId===sourceId);
+      sourceType=purpose==="HISTORICAL" && row?.supportsArchive?"ARCHIVE_RPC":"RPC_GET_LOGS";
+    }
+    rangeSources.add(`${sourceType}:${sourceId}`);
+    for(const log of batch) provenance.set(logKey(log),{type:sourceType,id:sourceId});
     logs.push(...batch);
     start = end + 1;
   }
@@ -85,7 +157,7 @@ export async function readRange(
     }
   const needed = [
     ...new Set([from, to, ...logs.map((log) => Number(BigInt(log.blockNumber)))]),
-  ].filter((n) => !blocks.has(n));
+  ].filter((n) => indexedHash || !blocks.has(n));
   if (needed.length) {
     const fetched = await rpc.batch(
       needed.map((n) => ({
@@ -96,6 +168,14 @@ export async function readRange(
     for (let i = 0; i < needed.length; i++) {
       const block = blockSchema.parse(fetched[i]);
       if (Number(BigInt(block.number)) !== needed[i]) throw new Error("Malformed block identity");
+      const prior=blocks.get(needed[i]);
+      if(prior && (prior.hash.toLowerCase()!==block.hash.toLowerCase() ||
+        prior.timestamp!==Number(BigInt(block.timestamp))*1000)) {
+        if(indexedHash && indexerId)
+          store.recordEventSource(indexerId,pool.chain,purpose,false,null,null,0,
+            "INDEXER_BLOCK_MISMATCH",false);
+        throw new Error("INDEXER_BLOCK_MISMATCH");
+      }
       blocks.set(needed[i], {
         hash: block.hash,
         timestamp: Number(BigInt(block.timestamp)) * 1000,
@@ -153,11 +233,18 @@ export async function readRange(
       priceConfidence: (swap.amount0 > 0n ? p0 : p1)?.confidence ?? "UNAVAILABLE",
       sender: `0x${log.topics[1].slice(-40)}`.toLowerCase(),
       confidence: amount.feesUsd === null ? "UNAVAILABLE" : "MEDIUM",
+      eventSourceType:provenance.get(logKey(log))?.type??null,
+      eventSourceId:provenance.get(logKey(log))?.id??null,
     });
   }
   const final = await blockAt(rpc, to);
-  if (final.hash !== blocks.get(to)!.hash) throw new Error("Block changed during fee read");
-  return { events, first: blocks.get(from)!, last: blocks.get(to)! };
+  if (final.hash.toLowerCase() !== blocks.get(to)!.hash.toLowerCase())
+    throw new Error("Block changed during fee read");
+  if(indexedHash && final.hash.toLowerCase()!==indexedHash.toLowerCase())
+    throw new Error("INDEXER_BLOCK_MISMATCH");
+  return { events, first: blocks.get(from)!, last: blocks.get(to)!,
+    sourceType:rangeSources.size>1?"MIXED":sourceType,
+    sourceId:rangeSources.size>1?"MULTIPLE":sourceId };
 }
 
 export async function validateCursor(
@@ -297,30 +384,46 @@ export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
   const confirmedBlock=headBlock-env.FEE_CONFIRMATIONS;
   const confirmed=await blockAt(rpc,confirmedBlock);
   let cursor=store.liveFeeCursor(pool.id);
+  const prior=cursor;
   if (cursor) {
     const current=await blockAt(rpc,cursor.blockNumber);
-    if (current.hash.toLowerCase()!==cursor.blockHash.toLowerCase() ||
-      liveCursorNeedsRestart(cursor.endTime,cursor.updatedAt,confirmed.timestamp)) {
+    if (current.hash.toLowerCase()!==cursor.blockHash.toLowerCase()) {
+      store.rollbackIndexedFees(pool.id,cursor.startBlock);
+      cursor=null;
+    } else if (liveCursorNeedsRestart(cursor.endTime,cursor.updatedAt,confirmed.timestamp)) {
       store.resetLiveFeeCursor(pool.id);
       cursor=null;
     }
   }
+  if(cursor && cursor.blockNumber>confirmedBlock) throw new Error("LIVE_RPC_BEHIND_CURSOR");
   const bootstrap=pool.chain==="bsc" ? env.BSC_LIVE_BOOTSTRAP_BLOCKS : env.BASE_LIVE_BOOTSTRAP_BLOCKS;
   const from=cursor ? cursor.blockNumber+1 : Math.max(0,confirmedBlock-bootstrap);
   const to=Math.min(confirmedBlock,from+env.LIVE_MAX_BLOCKS_PER_JOB-1);
   if (from>to) return {indexed:0,cursor,headBlock,headTime,status:"CURRENT"};
-  const batch=await readRange(pool,rpc,store,from,to);
+  const batch=await readRange(pool,rpc,store,from,to,"LIVE");
+  if(!cursor && prior && from>prior.blockNumber+1)
+    store.recordFeeGap(pool.id,prior.blockNumber+1,from-1,prior.endTime,batch.first.timestamp,
+      "LIVE_CURSOR_RESTART");
   store.saveLiveFeeBatch(pool.id,pool.chain,batch.events,from,batch.first.timestamp,to,batch.last.hash,
-    batch.last.timestamp,headBlock,headTime,"RPC_GET_LOGS",
-    rpc instanceof RpcRouter ? rpc.lastLogSourceId ?? "UNKNOWN" : "DIRECT_RPC");
+    batch.last.timestamp,headBlock,headTime,batch.sourceType,batch.sourceId);
   cursor=store.liveFeeCursor(pool.id);
   if (!cursor) throw new Error("Live fee cursor not saved");
+  store.resolveFeeGaps(pool.id,cursor.startBlock,cursor.blockNumber);
   const end=Math.floor(cursor.endTime/60000)*60000;
   for (const window of windows) {
-    const covered=cursor.startTime<=end-windowMs[window] &&
-      confirmed.timestamp-cursor.endTime<=180000;
-    store.saveFeeWindow(pool.id,window,store.materializedFeeWindow(pool.id,window,end,covered,
-      cursor.startBlock,cursor.blockNumber));
+    const start=end-windowMs[window];
+    const gaps=store.openFeeGaps(pool.id,start,end) as {fromTime:number;toTime:number}[];
+    const coverageStart=Math.max(start,cursor.startTime),coverageEnd=Math.min(end,cursor.endTime);
+    const coveragePct=feeCoveragePct(start,end,coverageStart,coverageEnd,gaps);
+    const stale=confirmed.timestamp-cursor.endTime>180000;
+    const covered=coveragePct>=99.9 && !gaps.length && !stale;
+    const data=store.materializedFeeWindow(pool.id,window,end,covered,
+      cursor.startBlock,cursor.blockNumber);
+    data.coverageStart=coverageStart;data.coverageEnd=coverageEnd;data.coveragePct=coveragePct;
+    data.eventSource=`${cursor.sourceType}:${cursor.sourceId}`;
+    data.continuityState=feeContinuity(coveragePct,gaps.length>0,stale,
+      data.methodology==="EVENT_DERIVED");
+    store.saveFeeWindow(pool.id,window,data);
   }
   return {indexed:batch.events.length,cursor,headBlock,headTime,
     status:confirmedBlock-cursor.blockNumber<=bootstrap/20 ? "CURRENT" : "CATCHING_UP"};
