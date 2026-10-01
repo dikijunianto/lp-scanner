@@ -1,0 +1,9 @@
+# Reliability operations
+
+The historical 486-second foreground scan coincided with a 398-second macOS sleep on 28 September 2026. The scan's three HTTP requests reported roughly 486 seconds each after wake. JavaScript timers do not run while the host sleeps, so this was a host-suspension outlier, not evidence that a provider was deliberately allowed a 486-second timeout. Raw failed scans remain in latency statistics.
+
+Foreground scans have a 20-second default deadline (`SCAN_DEADLINE_MS`). Discovery fetches and their retry waits receive its abort signal. A second scan request records `scanSkippedBecausePreviousRunning` and uses the running scan. Phase and network spans, including failure and configured timeout, are stored in `scan_phase_spans`. SQLite's synchronous calls cannot be interrupted by `AbortSignal`; their measured durations remain visible. The production burn-in uses macOS `caffeinate` to prevent another sleep-related validation gap.
+
+A separate process writes compact core snapshots each minute. Each write is a short SQLite immediate transaction; its result, duration, and busy-retry count are stored in `core_writer_runs`. Historical enrichment pauses at critical disk pressure. The reliability dashboard and burn-in report show the measured continuity, field coverage, latency, provider state, and storage runway. A 4-hour pass requires every sampled health check to succeed, sample gaps at most three minutes, at least one measured scan, no scan above 20 seconds, and the full requested duration. Readiness has additional gates documented in [readiness-v2.md](readiness-v2.md).
+
+The foreground deadline applies to asynchronous operations that honor cancellation. A long synchronous SQLite call or an operating-system suspension can still increase wall-clock duration; these are reported as failures, never excluded from the denominator.

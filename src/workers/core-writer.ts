@@ -5,13 +5,19 @@ const store=createStore();
 let stopped=false;
 let timer:ReturnType<typeof setTimeout>|undefined;
 let lastErrorMinute=-1;
+let retries=0;
 const write=()=>{
   if(stopped) return;
   let retry=false;
-  try {store.writeCoreSnapshots();}
+  const started=Date.now(),minute=Math.floor(started/60000);
+  try {
+    const rows=store.writeCoreSnapshots(started);
+    store.recordCoreWriterRun(minute*60000,started,rows,retries,"OK");
+    retries=0;
+  }
   catch(error) {
     retry=true;
-    const minute=Math.floor(Date.now()/60000);
+    retries++;
     if(minute!==lastErrorMinute) console.error("Core snapshot write failed",error);
     lastErrorMinute=minute;
   }

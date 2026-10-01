@@ -103,7 +103,7 @@ export class EvmPoolAdapter implements Adapter {
   ) {
     this.name = config.name;
   }
-  async scan() {
+  async scan(signal?:AbortSignal) {
     const pools: Pool[] = [];
     const notes: string[] = [];
     if (this.config.subgraph) {
@@ -123,9 +123,10 @@ export class EvmPoolAdapter implements Adapter {
                 pools: z.array(graphPool.extend({ poolHourData: z.array(hourly) })),
               }),
             }),
-            { body: { query } },
+            { body: { query },signal },
           );
           for (const raw of result.data.pools) {
+            signal?.throwIfAborted();
             const p = emptyPool({
               chain: this.config.chain,
               protocol: this.config.protocol,
@@ -177,9 +178,11 @@ export class EvmPoolAdapter implements Adapter {
         const result = await this.http.json(
           `${env.GECKO_API_URL}/networks/${this.config.chain}/dexes/${this.config.dexId}/pools?page=${page}`,
           z.object({ data: z.array(z.unknown()) }),
+          {signal},
         );
         let invalid = 0;
         for (const raw of result.data) {
+          signal?.throwIfAborted();
           try {
             pools.push(normalizeEvm(raw, this.config));
           } catch {

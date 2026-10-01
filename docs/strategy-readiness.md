@@ -1,7 +1,5 @@
 # Strategy Lab readiness gate
 
-This sprint adds only a readiness evaluation. It does not create Strategy Lab, strategies, wallet signing, or trading. Data health reports `READY` only when every selected-chain gate passes: foreground p95 below 20 seconds; Base HOT complete current 1-hour fees at least 80%; BSC at least 70% unless explicitly excluded; reliable-price HOT ±5% depth at least 70%; mature compact snapshot and reliable-price coverage at least 95%; STANDARD-confidence eligible 4-hour price/range completion at least 70% and 24-hour at least 60%; recent outcome p95 lateness below 30 minutes; a healthy log-capable source for selected EVM chains; at least 180 days forecast disk runway; and at least one hour of post-version storage evidence below 0.20 GiB/day.
+Sprint 8 evaluates Solana and Base independently of BSC. `STRATEGY_BSC_EXCLUDED` remains accepted for older configurations but no longer changes readiness. The complete gate definitions and denominators are in [readiness-v2.md](readiness-v2.md).
 
-Set `STRATEGY_BSC_EXCLUDED=true` to evaluate only Meteora and Base. The scorecard still shows BSC's poor data, and selected chains are explicit. This setting cannot override Base, depth, snapshot, outcome, provider, or storage gates. Newly introduced dataset version `sprint7-v1` records methods for snapshots, fees, depth, prices, and outcomes; future research runs must reference a dataset version.
-
-These thresholds are quality gates, not trading advice. `NOT_READY` is expected until enough new one-minute observations mature and missing log/depth infrastructure is restored. Historical gaps and unavailable measurements are never relabeled to pass the gate.
+Readiness is an evaluation only. It does not create Strategy Lab, strategies, wallet signing, or trading. Historical gaps and unavailable measurements never pass a gate.

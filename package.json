@@ -19,7 +19,10 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "scanner": "tsx src/workers/cli.ts",
     "retention": "tsx src/workers/retention.ts",
-    "core-writer": "tsx src/workers/core-writer.ts"
+    "storage:archive": "tsx src/workers/retention.ts --archive",
+    "dataset:freeze": "tsx src/workers/dataset-freeze.ts",
+    "core-writer": "tsx src/workers/core-writer.ts",
+    "burnin": "tsx src/workers/burnin.ts"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

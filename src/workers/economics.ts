@@ -18,6 +18,7 @@ export class EconomicWorker {
     return this.active;
   }
   private async execute() {
+    if(this.store.diskState()==="EMERGENCY") return;
     const snapshots=this.store.list();
     if(!snapshots.length) return;
     const watched=this.store.watchedIds();

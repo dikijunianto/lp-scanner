@@ -1,0 +1,9 @@
+# Storage emergency control
+
+The default free-space thresholds are WARNING below 30 GiB, HIGH below 20 GiB, CRITICAL below 10 GiB, and EMERGENCY below 5 GiB. All are configurable with `DISK_*_GIB`. Critical pressure pauses historical enrichment. Emergency pressure also pauses nonessential depth/economic work and new full JSON snapshots. Core snapshots and live event ingestion continue.
+
+Measure table and index pages with `pnpm retention --profile`; the timestamp-based new-row estimate can miss delayed ingestion of old blockchain events. Burn-in records actual database/free-space sizes and `dbstat` table/index bytes and row counts before and after. Readiness uses positive table/index page allocation over a four-hour measured interval. SQLite deleted pages are reused; they do not immediately reduce the file size. The duplicated `snapshots_pool_time` index was removed after `EXPLAIN QUERY PLAN` confirmed that SQLite's existing unique `(pool_id,timestamp)` index serves the same query. The time-only index remains.
+
+`pnpm storage:archive --dry-run` reports at most 500 safe candidates per run. `pnpm storage:archive --apply` writes and verifies a gzip archive and SHA-256 manifest before deleting that batch. It preserves signal ±24-hour windows, watchlist periods, unresolved outcomes, and pre-Sprint-7 history. No archive runs automatically. The dry-run count is capped, not a full-table estimate.
+
+Do not run full `VACUUM` on this nearly full disk: SQLite may need another database-sized temporary copy. A WAL checkpoint, `ANALYZE`, and reuse of freed pages are safer routine operations; run a full vacuum only after obtaining enough additional free space and a verified backup. If measured growth still leaves less than 180 days of runway, add disk capacity instead of claiming compression solves the hardware limit.

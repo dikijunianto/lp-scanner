@@ -86,29 +86,41 @@ app.get("/research/coverage", async () => ({ coverage: store.coverage(), counts:
     poolId:j.pool_id,chain:j.chain,status:j.status,startBlock:j.start_block,endBlock:j.end_block,
     retryCount:j.retry_count,failureReason:j.failure_reason,
   })) }));
-app.get("/diagnostics/data-health", async () => {
+const dataHealth=async () => {
   const generatedAt=Date.now();
   const providers=store.rpcProviders();
+  const bscProviders=providers.filter((p)=>p.chain==="bsc" && p.providerType==="CONFIGURED");
+  const bscWebSocket=store.bscWsStatus();
+  const eventSources=store.eventSources() as {chain:string;purpose:string;healthState:string}[];
+  const bscSource={
+    liveLogs:bscWebSocket?.status==="LIVE" || bscProviders.some((p)=>p.supportsGetLogs===true && p.healthState==="HEALTHY") ||
+      eventSources.some((s)=>s.chain==="bsc" && s.purpose==="LIVE" && s.healthState==="HEALTHY"),
+    historicalLogs:bscProviders.some((p)=>p.supportsGetLogs===true && p.healthState==="HEALTHY") ||
+      eventSources.some((s)=>s.chain==="bsc" && s.purpose==="HISTORICAL" && s.healthState==="HEALTHY"),
+    archiveState:bscProviders.some((p)=>p.supportsHistoricalState===true && p.healthState==="HEALTHY"),
+    websocket:bscWebSocket?.status??"DISABLED",
+  };
   const hotCoverage=store.hotCoverage(generatedAt);
   const snapshotCoverage=store.coreSnapshotCoverage(generatedAt);
   const scanLatency=store.scanLatency();
   const outcomeFieldCoverage=store.outcomeFieldCoverage(generatedAt);
+  const selectedOutcomeCoverage=store.outcomeFieldCoverage(generatedAt,true);
   const recentOutcomeLag=store.recentOutcomeLag(generatedAt);
+  const newOutcomeLag=store.newOutcomeLag(generatedAt);
   const databaseGrowth=store.databaseGrowth(generatedAt);
   const storageGrowth=store.storageGrowthSinceVersion(generatedAt);
-  const priorRate=databaseGrowth.rows.reduce((n,r)=>n+r.estimatedBytesPerDay,0);
-  const diskSafety=store.diskSafety(storageGrowth.hours>=24 && storageGrowth.estimatedBytesPerDay!==null
-    ? storageGrowth.estimatedBytesPerDay:priorRate);
-  const eventSources=store.eventSources() as {chain:string;healthState:string}[];
-  const readiness=assessReadiness({foregroundP95Ms:scanLatency.p95Ms,hot:hotCoverage,
-    snapshot:snapshotCoverage,outcomes:outcomeFieldCoverage,
-    outcomeP95LagMs:recentOutcomeLag.p95Ms,providers:[...providers,
+  const measuredStorageGrowth=store.measuredStorageGrowth(generatedAt);
+  const diskSafety=store.diskSafety(measuredStorageGrowth.bytesPerDay);
+  const readiness=assessReadiness({foregroundP95Ms:scanLatency.p95Ms,
+    foregroundP99Ms:scanLatency.p99Ms,hot:hotCoverage,
+    snapshot:snapshotCoverage,outcomes:selectedOutcomeCoverage,
+    newOutcomeP95LagMs:newOutcomeLag.p95Ms,providers:[...providers,
       ...eventSources.map((s)=>({...s,supportsGetLogs:true}))],diskDaysRemaining:diskSafety?.estimatedDaysRemaining??null,
-    growthBytesPerDay:storageGrowth.estimatedBytesPerDay,growthHours:storageGrowth.hours,
-    excludeBsc:env.STRATEGY_BSC_EXCLUDED});
+    growthBytesPerDay:measuredStorageGrowth.bytesPerDay,
+    growthHours:measuredStorageGrowth.hours});
   return {
   generatedAt,
-  providers, usage: store.recentRpcUsage(), priceCalls: store.recentPriceCalls(),
+  providers,bscSource, usage: store.recentRpcUsage(), priceCalls: store.recentPriceCalls(),
   coverage: store.coverage(), currentFees: store.currentFeeCoverage(),
   historicalFees: store.historicalFeeCoverage(), priceBackfill: store.priceBackfillProgress(),
   missingPriceReasons: store.priceReasonCounts(),
@@ -127,12 +139,16 @@ app.get("/diagnostics/data-health", async () => {
   outcomeMissingness:store.outcomeMissingness(),outcomeLag:store.outcomeCompletionLag(),
   outcomeThroughput:store.outcomeThroughput(),outcomeConcurrency:env.OUTCOME_WORKER_CONCURRENCY,
   depthFailures:store.depthFailureCounts(),bscDepthFailures:store.depthFailureCounts("bsc"),
-  databaseGrowth,storageGrowth,hotCoverage,snapshotCoverage,scanLatency,outcomeFieldCoverage,
-  recentOutcomeLag,diskSafety,readiness,datasetVersion:store.datasetVersion(),
+  databaseGrowth,storageGrowth,measuredStorageGrowth,hotCoverage,snapshotCoverage,scanLatency,outcomeFieldCoverage,
+  recentOutcomeLag,newOutcomeLag,selectedOutcomeCoverage,diskSafety,readiness,
+  datasetVersion:store.datasetVersion(),scanSkippedBecausePreviousRunning:store.scanSkipped(),
+  scanSpans:store.recentScanSpans(),coreWriter:store.coreWriterHealth(),
   liveRuns:store.recentLiveRuns(),slowCalls:store.recentSlowCalls(),eventSources,
   sourceDisagreements:store.sourceDisagreementRates(),
   };
-});
+};
+app.get("/diagnostics/data-health",dataHealth);
+app.get("/diagnostics/reliability",dataHealth);
 app.get("/diagnostics/pool-freshness/:id", async (request,reply) => {
   const {id}=z.object({id:z.string().min(1).max(180)}).parse(request.params);
   return store.poolFreshness(id)??reply.code(404).send({error:"Pool not found"});

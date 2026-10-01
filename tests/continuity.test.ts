@@ -8,10 +8,17 @@ import { assessReadiness } from "../src/core/readiness";
 import { fetchIndexedSwaps } from "../src/adapters/log-sources";
 import { HttpClient } from "../src/adapters/http";
 import { BackgroundWorker } from "../src/workers/background";
+import { Scanner } from "../src/workers/scanner";
+import { scanDistribution,burninPass } from "../src/core/burnin";
+import { diskMode } from "../src/db/continuity";
 import { readDepthContracts } from "../src/adapters/evm-depth";
+import { RpcRouter } from "../src/adapters/rpc-router";
 import type { ReadOnlyRpc } from "../src/adapters/liquidity-rpc";
 import { swapTopic } from "../src/core/fees";
 import { feeContinuity,feeCoveragePct } from "../src/adapters/evm-fees";
+import { BscWsSource } from "../src/adapters/bsc-ws";
+import { verifyArchive } from "../src/core/archive";
+import { gzipSync } from "node:zlib";
 import { mkdtempSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,9 +36,132 @@ const pool=(at:number)=>{
 };
 const policy:SignalPolicy={feeEfficiency:.001,volumeDepth:1,activity:70,risk:60,
   breakoutPct:5,collapsePct:20,persistenceFraction:.5,maxObservationGapMs:240000};
-afterEach(()=>vi.unstubAllGlobals());
+afterEach(()=>{vi.unstubAllGlobals();vi.useRealTimers();});
 
 describe("Sprint 7 continuity",()=>{
+  it("verifies archived row identities and exact contents before deletion",()=>{
+    const plain=Buffer.from(JSON.stringify({format:"lp-scanner-archive-v1",
+      snapshots:[{id:7,row:{data:"saved"}}],events:[]}));
+    const saved=gzipSync(plain);
+    expect(verifyArchive(saved,plain,[7],[])).toMatchObject({snapshotRows:1,eventRows:0});
+    expect(()=>verifyArchive(saved,plain,[8],[])).toThrow("Archive integrity");
+    expect(()=>verifyArchive(saved,Buffer.from("changed"),[7],[])).toThrow("Archive contents");
+  });
+  it("serializes compact V2 rows once per minute and keeps the unique pool-time index",()=>{
+    const dir=mkdtempSync(join(tmpdir(),"lp-core-")),path=join(dir,"scanner.sqlite");
+    try {
+      const store=createStore(path),db=new Database(path);
+      try {
+        const at=Math.floor(Date.now()/60000)*60000;
+        store.save([snapshot(pool(at),[])],true);
+        expect(store.writeCoreSnapshots(at)).toBe(1);
+        expect(store.writeCoreSnapshots(at)).toBe(0);
+        const row=db.prepare("SELECT methodology_version version,COUNT(*) n FROM core_snapshots")
+          .get() as {version:string;n:number};
+        expect(row).toEqual({version:"sprint8-core-v2",n:1});
+        const indexes=db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='pool_snapshots'")
+          .all() as {name:string}[];
+        expect(indexes.map((r)=>r.name)).toContain("sqlite_autoindex_pool_snapshots_1");
+        expect(indexes.map((r)=>r.name)).not.toContain("snapshots_pool_time");
+      } finally {db.close();store.close();}
+    } finally {rmSync(dir,{recursive:true,force:true});}
+  });
+  it("uses measured table and index allocations for runway, including old event timestamps",()=>{
+    const dir=mkdtempSync(join(tmpdir(),"lp-storage-")),path=join(dir,"scanner.sqlite");
+    try {
+      const store=createStore(path),db=new Database(path);
+      try {
+        const at=Date.now()-4*3600000;
+        const insert=db.prepare("INSERT INTO storage_measurements VALUES (?,?,?,?)");
+        insert.run(at,1000,1000,JSON.stringify([{name:"fee_events",bytes:100},
+          {name:"fee_events_time",bytes:20}]));
+        insert.run(at+4*3600000,1000,1000,JSON.stringify([{name:"fee_events",bytes:300},
+          {name:"fee_events_time",bytes:70}]));
+        expect(store.measuredStorageGrowth(at+4*3600000)).toMatchObject({hours:4,
+          allocatedBytes:250,databaseBytesDelta:0,bytesPerDay:1500});
+      } finally {db.close();store.close();}
+    } finally {rmSync(dir,{recursive:true,force:true});}
+  });
+  it("separates verified no-swap windows from missing log coverage",()=>{
+    const store=createStore(":memory:");
+    try {
+      const end=Math.floor(Date.now()/60000)*60000;
+      expect(store.materializedFeeWindow("missing","1h",end,true,1,2).activityState)
+        .toBe("NO_ACTIVITY");
+      expect(store.materializedFeeWindow("missing","1h",end,false,1,2).activityState)
+        .toBe("MISSING_DATA");
+    } finally {store.close();}
+  });
+  it("deduplicates confirmed WebSocket swap hints and reconnects",async()=>{
+    vi.useFakeTimers();
+    class Socket extends EventTarget {
+      readyState=1;sent:string[]=[];
+      send(value:string) {this.sent.push(value);}
+      close() {this.readyState=3;}
+      message(value:unknown) {this.dispatchEvent(new MessageEvent("message",{data:JSON.stringify(value)}));}
+    }
+    const sockets:Socket[]=[];
+    let confirmed=0;
+    const source=new BscWsSource("wss://example.invalid",[address],2,()=>{confirmed++;},
+      undefined,()=>{const socket=new Socket();sockets.push(socket);return socket as unknown as WebSocket;});
+    source.start();
+    sockets[0].dispatchEvent(new Event("open"));
+    sockets[0].message({id:1,result:"logs"});
+    sockets[0].message({id:2,result:"heads"});
+    expect(source.status).toBe("LIVE");
+    const log={blockNumber:"0x64",blockHash:hash("a"),transactionHash:hash("b"),logIndex:"0x0"};
+    sockets[0].message({params:{subscription:"logs",result:log}});
+    sockets[0].message({params:{subscription:"logs",result:log}});
+    sockets[0].message({params:{subscription:"heads",result:{number:"0x66"}}});
+    expect(confirmed).toBe(1);
+    sockets[0].message({params:{subscription:"logs",result:{...log,removed:true}}});
+    expect(confirmed).toBe(2);
+    sockets[0].message({params:{subscription:"heads",result:{number:"invalid"}}});
+    expect(confirmed).toBe(2);
+    sockets[0].dispatchEvent(new Event("close"));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sockets).toHaveLength(2);
+    source.stop();
+  });
+  it("never treats public BSC RPCs as a managed log source",async()=>{
+    const store=createStore(":memory:");
+    try {
+      const rpc=new RpcRouter("bsc",store,["https://one.example","https://two.example"]);
+      await expect(rpc.call("eth_getLogs",[{fromBlock:"0x1",toBlock:"0x1"}]))
+        .rejects.toThrow("RPC_CAPABILITY_UNAVAILABLE");
+    } finally {store.close();}
+  });
+  it("keeps disk emergency and burn-in failures visible",()=>{
+    expect(diskMode(4*2**30)).toBe("EMERGENCY");
+    expect(diskMode(9*2**30)).toBe("CRITICAL");
+    expect(diskMode(19*2**30)).toBe("HIGH");
+    expect(diskMode(29*2**30)).toBe("WARNING");
+    const scans=scanDistribution([...Array(99).fill(1000),486733]);
+    expect(scans.p99Ms).toBe(1000);
+    expect(scans.maxMs).toBe(486733);
+    expect(burninPass([{at:0,healthy:true},{at:240000,healthy:true}],240000,scans,0,240000))
+      .toBe(false);
+  });
+  it("aborts a stalled scan at the global deadline and counts overlap",async()=>{
+    vi.useFakeTimers();
+    const store=createStore(":memory:");
+    try {
+      const scanner=new Scanner(store,[{name:"stalled",candles:async()=>[],
+        scan:(signal?:AbortSignal)=>new Promise((_,reject)=>{
+          signal?.addEventListener("abort",()=>reject(signal.reason),{once:true});
+        })}]);
+      const run=scanner.scan();
+      expect(scanner.scan()).toBe(run);
+      expect(store.scanSkipped()).toBe(1);
+      await vi.advanceTimersByTimeAsync(20000);
+      await run;
+      expect(scanner.running).toBe(false);
+      expect(store.scanLatency().p99Ms).toBe(20000);
+      expect(store.recentScanSpans().some((s)=>
+        (s as {phase:string;success:number}).phase==="discovery" &&
+        (s as {success:number}).success===0)).toBe(true);
+    } finally {store.close();}
+  });
   it("includes a single severe scan outlier in p99",()=>{
     const dir=mkdtempSync(join(tmpdir(),"lp-latency-")),path=join(dir,"scanner.sqlite");
     try {
@@ -59,6 +189,9 @@ describe("Sprint 7 continuity",()=>{
       expect(coverage.expected).toBe(3);
       expect(coverage.largestGapMs).toBe(60000);
       p.timestamp=at+5*60000;store.save([snapshot(p,[])],true);
+      expect(store.history(p.id,0)).toHaveLength(1);
+      store.watch(p.id,true);
+      p.timestamp=at+10*60000;store.save([snapshot(p,[])],true);
       expect(store.history(p.id,0)).toHaveLength(2);
       expect(store.storageGrowthSinceVersion(Date.now()+3600000).estimatedBytesPerDay).toBeGreaterThan(0);
     } finally {store.close();}
@@ -130,19 +263,21 @@ describe("Sprint 7 continuity",()=>{
       fee:"UNAVAILABLE",depth:"UNAVAILABLE",liquidity:"UNAVAILABLE"});
     expect(outcome.overallCompletenessPct).toBe(40);
   });
-  it("requires every readiness gate, with explicit BSC exclusion only",()=>{
-    const good={foregroundP95Ms:10000,hot:[
+  it("requires every selected-chain gate and evaluates BSC separately",()=>{
+    const good={foregroundP95Ms:10000,foregroundP99Ms:12000,hot:[
+      {chain:"solana",pools:10,priced:10,depth5Priced:8,fee1h:0},
       {chain:"base",pools:10,priced:10,depth5Priced:8,fee1h:9},
       {chain:"bsc",pools:10,priced:10,depth5Priced:8,fee1h:0}],
-      snapshot:{maturePools:2,tracked:2,coveragePct:100,priceCoveragePct:100},
+      snapshot:{maturePools:2,tracked:2,coveragePct:100,largestGapMs:60000},
       outcomes:[{horizon:"4h",eligible:10,priceRangeComplete:8},
-        {horizon:"24h",eligible:10,priceRangeComplete:7}],outcomeP95LagMs:100000,
+        {horizon:"24h",eligible:10,priceRangeComplete:7}],newOutcomeP95LagMs:100000,
       providers:[{chain:"base",supportsGetLogs:true,healthState:"HEALTHY"}],
-      diskDaysRemaining:200,growthBytesPerDay:100000000,growthHours:24,excludeBsc:true};
+      diskDaysRemaining:200,growthBytesPerDay:100000000,growthHours:24};
     expect(assessReadiness(good).status).toBe("READY");
-    expect(assessReadiness({...good,excludeBsc:false}).failed).toContain("BSC_LIVE_FEES");
-    expect(assessReadiness({...good,snapshot:{...good.snapshot,priceCoveragePct:90}}).failed)
-      .toContain("SNAPSHOT_CONTINUITY");
+    expect(assessReadiness(good).bsc.failed).toContain("BSC_LIVE_FEES");
+    expect(assessReadiness({...good,foregroundP99Ms:30000}).failed).toContain("FOREGROUND_P99");
+    expect(assessReadiness({...good,snapshot:{...good.snapshot,largestGapMs:240000}}).failed)
+      .toContain("SNAPSHOT_MAX_GAP");
   });
   it("rejects incomplete indexer ranges and validates empty anchored ranges",async()=>{
     const body={chain:"base",pool:address,fromBlock:10,throughBlock:11,complete:true,

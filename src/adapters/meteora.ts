@@ -80,7 +80,7 @@ export function normalizeMeteora(raw: unknown, now = Date.now()): Pool {
 export class MeteoraAdapter implements Adapter {
   name = "Meteora DLMM";
   constructor(private http = new HttpClient(1000 / env.METEORA_REQUESTS_PER_SECOND)) {}
-  async scan() {
+  async scan(signal?:AbortSignal) {
     const pools: Pool[] = [];
     const notes: string[] = [];
     let pages = 1;
@@ -101,10 +101,12 @@ export class MeteoraAdapter implements Adapter {
           total: z.number().int().nonnegative(),
           data: z.array(z.unknown()),
         }),
+        {signal},
       );
       pages = result.pages;
       total = result.total;
       for (const raw of result.data) {
+        signal?.throwIfAborted();
         try {
           pools.push(normalizeMeteora(raw));
         } catch {
