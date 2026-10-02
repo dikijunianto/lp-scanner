@@ -147,6 +147,7 @@ export function PoolDetail({ id }: { id: string }) {
                 <th>FEES</th>
                 <th>SOURCE</th>
                 <th>CONFIDENCE</th>
+                <th>ACTIVITY</th>
                 <th>THROUGH</th>
               </tr>
             </thead>
@@ -160,6 +161,7 @@ export function PoolDetail({ id }: { id: string }) {
                     <td>{usd(fee?.feesUsd ?? null)}</td>
                     <td>{fee?.methodology ?? "UNAVAILABLE"}</td>
                     <td>{fee?.confidence ?? "UNAVAILABLE"}</td>
+                    <td>{fee?.activityState??"MISSING_DATA"}</td>
                     <td>{fee ? new Date(fee.windowEnd).toLocaleTimeString() : "—"}</td>
                   </tr>
                 );

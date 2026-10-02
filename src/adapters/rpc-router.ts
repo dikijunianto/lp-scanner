@@ -13,7 +13,8 @@ const minute = () => Math.floor(Date.now() / 60000) * 60000;
 const multicall = new Interface(["function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) returns (tuple(bool success,bytes returnData)[])"]);
 export function rpcUrls(chain: string) {
   const list = chain === "base" ? env.BASE_RPC_URLS : chain === "bsc" ? env.BNB_RPC_URLS : env.SOLANA_RPC_URLS;
-  const dedicated=chain==="bsc"?env.BSC_LOG_RPC_URLS.split(","):[];
+  const dedicated=chain==="bsc"?[env.BSC_LOG_RPC_URL,env.BSC_ARCHIVE_RPC_URL,
+    ...env.BSC_LOG_RPC_URLS.split(",")]:[];
   const prior = chain === "base" ? [env.BASE_RPC_URL,env.BASE_DEPTH_RPC_URL] : chain === "bsc"
     ? [env.BSC_FEE_RPC_URL,env.BSC_RPC_URL] : [env.SOLANA_RPC_URL];
   const defaults = chain === "base" ? [evmNetworks.base.url,"https://base-rpc.publicnode.com"]
@@ -83,7 +84,8 @@ export class RpcRouter extends ReadOnlyRpc {
     return this.providers.filter((p) => {
       if(p.row.cooldownUntil>now) return false;
       if(p.row.circuitState==="OPEN") {p.row.circuitState="HALF_OPEN";this.store.saveRpcProvider(p.row);}
-      return capability!=="supportsGetLogs" || p.row.supportsGetLogs!==false;
+      return (capability!=="supportsGetLogs" || p.row.supportsGetLogs!==false) &&
+        !(this.chain==="bsc" && method==="eth_getLogs" && p.row.providerType!=="CONFIGURED");
     })
       .sort((a,b) => {
         const score = (p: typeof a) => (capability && p.row[capability] === true ? 1000 : 0)

@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import { env } from "../config/env";
-import { countApi, countCache, traceSlow } from "../core/traffic";
+import { countApi, countCache, traceSlow,traceSpan } from "../core/traffic";
 export class HttpClient {
   private nextAt = 0;
   private cache = new Map<string, { until: number; data: unknown }>();
@@ -14,7 +14,7 @@ export class HttpClient {
   async json<T>(
     url: string,
     schema: z.ZodType<T>,
-    options: { body?: unknown; ttl?: number } = {},
+    options: { body?: unknown; ttl?: number; signal?: AbortSignal } = {},
   ): Promise<T> {
     const key = `${url}:${JSON.stringify(options.body ?? "")}`;
     const cached = this.cache.get(key);
@@ -22,10 +22,11 @@ export class HttpClient {
     for (let attempt = 0; attempt <= this.retries; attempt++) {
       const wait = Math.max(0, this.nextAt - Date.now());
       this.nextAt = Date.now() + wait + this.spacingMs;
-      if (wait) await sleep(wait);
+      if (wait) await sleep(wait,undefined,{signal:options.signal});
       const started=Date.now();
       let reason="OK";
       try {
+        options.signal?.throwIfAborted();
         countApi();
         const response = await this.fetcher(url, {
           method: options.body ? "POST" : "GET",
@@ -34,7 +35,8 @@ export class HttpClient {
             ...(options.body ? { "content-type": "application/json" } : {}),
           },
           body: options.body ? JSON.stringify(options.body) : undefined,
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: options.signal?AbortSignal.any([options.signal,AbortSignal.timeout(this.timeoutMs)]):
+            AbortSignal.timeout(this.timeoutMs),
         });
         if (!response.ok) {
           if ((response.status === 429 || response.status >= 500) && attempt < this.retries) {
@@ -45,7 +47,8 @@ export class HttpClient {
                 : Date.parse(retry) - Date.now()
               : 0;
             await response.body?.cancel();
-            await sleep(Math.min(30000, Math.max(500 * 2 ** attempt, retryMs || 0)));
+            await sleep(Math.min(30000, Math.max(500 * 2 ** attempt, retryMs || 0)),
+              undefined,{signal:options.signal});
             continue;
           }
           await response.body?.cancel();
@@ -60,12 +63,15 @@ export class HttpClient {
         return data;
       } catch (error) {
         reason=error instanceof Error?error.name:"ERROR";
+        if(options.signal?.aborted) throw options.signal.reason;
         if (error instanceof z.ZodError) throw new Error("Upstream response failed validation");
         if (error instanceof Error && error.message.startsWith("Upstream HTTP")) throw error;
         if (attempt === this.retries) throw new Error("Upstream request failed or timed out");
-        await sleep(500 * 2 ** attempt);
+        await sleep(500 * 2 ** attempt,undefined,{signal:options.signal});
       } finally {
         traceSlow(new URL(url).hostname,Date.now()-started,reason);
+        traceSpan("network",options.body?"POST":"GET",new URL(url).hostname,started,
+          this.timeoutMs,reason==="OK");
       }
     }
     throw new Error("Upstream retries exhausted");

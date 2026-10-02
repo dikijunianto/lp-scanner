@@ -7,3 +7,4 @@ data/
 *.tsbuildinfo
 *.log
 .DS_Store
+reports/

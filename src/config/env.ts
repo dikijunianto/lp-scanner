@@ -8,6 +8,11 @@ const schema = z.object({
   DATABASE_PATH: z.string().min(1).default("./data/scanner.sqlite"),
   API_PORT: integer(3001, 1024, 65535),
   SCAN_INTERVAL_SECONDS: integer(60, 15, 86400),
+  SCAN_DEADLINE_MS: integer(20000,1000,60000),
+  DISK_WARNING_GIB: integer(30,1,1000),
+  DISK_HIGH_GIB: integer(20,1,1000),
+  DISK_CRITICAL_GIB: integer(10,1,1000),
+  DISK_EMERGENCY_GIB: integer(5,1,1000),
   RETENTION_DAYS: integer(0, 0, 36500),
   METEORA_API_URL: z.url().default("https://dlmm.datapi.meteora.ag"),
   METEORA_MIN_TVL: z.coerce.number().nonnegative().default(10000),
@@ -23,6 +28,11 @@ const schema = z.object({
   BASE_RPC_URLS: z.string().default(""),
   BNB_RPC_URLS: z.string().default(""),
   BSC_LOG_RPC_URLS: z.string().default(""),
+  BSC_LOG_RPC_URL: optionalUrl,
+  BSC_ARCHIVE_RPC_URL: optionalUrl,
+  BSC_LOG_WSS_URL: z.preprocess((v)=>(v===""?undefined:v),z.url().refine((v)=>
+    v.startsWith("wss://") || v.startsWith("ws://127.0.0.1") ||
+    v.startsWith("ws://localhost"),"Secure WebSocket required").optional()),
   BASE_LIVE_INDEXER_URL: optionalUrl,
   BSC_LIVE_INDEXER_URL: optionalUrl,
   BASE_HISTORICAL_INDEXER_URL: optionalUrl,

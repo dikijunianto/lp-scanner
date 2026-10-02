@@ -29,6 +29,7 @@ export interface FeeWindow {
   grossFeesUsd?: Nullable;
   lpFeesUsd?: Nullable;
   swapCount?: number | null;
+  activityState?:"HAS_ACTIVITY"|"NO_ACTIVITY"|"MISSING_DATA";
   uniqueTraderCount?: number | null;
   windowStart: number;
   windowEnd: number;
@@ -156,7 +157,7 @@ export interface Snapshot {
 }
 export interface Adapter {
   name: string;
-  scan(): Promise<{ pools: Pool[]; notes: string[] }>;
+  scan(signal?: AbortSignal): Promise<{ pools: Pool[]; notes: string[] }>;
   candles(pool: Pool): Promise<Candle[]>;
 }
 export function emptyPool(

@@ -335,6 +335,7 @@ export function createResearchStore(sqlite: Database.Database) {
         grossFeesUsd: complete && row.grossUnknown === 0 ? row.gross : null,
         lpFeesUsd: complete ? row.lp : null,
         swapCount: complete ? row.swaps : null,
+        activityState:complete?(row.swaps===0?"NO_ACTIVITY":"HAS_ACTIVITY"):"MISSING_DATA",
         uniqueTraderCount: null,
         windowStart: start,
         windowEnd: end,

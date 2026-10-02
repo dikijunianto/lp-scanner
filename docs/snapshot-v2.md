@@ -1,0 +1,7 @@
+# Compact snapshots V2
+
+`sprint8-v2` marks the new write methodology in `dataset_versions`. The existing `core_snapshots` table is the compact numeric append format: pool reference, minute timestamp, source timestamp, price/confidence, activity, risk, one-hour volume and fees, active liquidity, ±5% depth, volatility, and methodology version `sprint8-core-v2`. Static token and protocol metadata stay in `pools`. Missing enrichment fields remain NULL; core cadence never waits for those enrichments.
+
+The older JSON `pool_snapshots` rows remain readable and unchanged. New full JSON snapshots are sampled every five minutes for watched or active-signal pools and hourly for other pools. This reduces new repeated metadata without destroying the minute-by-minute core series. Core field coverage is reported separately for reliable price, fee, and depth values.
+
+The dataset version is a methodology boundary, not an immutable database copy. Run `pnpm dataset:freeze` to create a consistent compressed SQLite backup with a version, chain set, coverage counts, SHA-256 manifest, and decompression check. This is manual because it needs roughly one database-sized temporary file and should run when storage permits. The pre-Sprint-8 compressed backup is retained locally. Historical downsampling is a dry run by default and protects signal, outcome, and watchlist periods. No migration rewrites old snapshot history.

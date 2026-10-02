@@ -1,9 +1,13 @@
 import "dotenv/config";
 import Database from "better-sqlite3";
-import { statSync } from "node:fs";
+import { gzipSync } from "node:zlib";
+import { mkdirSync,readFileSync,statSync,writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { env } from "../config/env";
+import { verifyArchive } from "../core/archive";
 
 const args=new Set(process.argv.slice(2));
+const archive=args.has("--archive"),archiveApply=archive && args.has("--apply");
 const daysArg=process.argv.find((arg)=>arg.startsWith("--event-days="));
 const eventDays=daysArg?Number(daysArg.split("=")[1]):30;
 if(!Number.isInteger(eventDays)||eventDays<30) throw new Error("--event-days must be at least 30");
@@ -55,8 +59,8 @@ const snapshots=db.prepare(`SELECT p.rowid id,LENGTH(p.data)+64 bytes FROM pool_
   WHERE p.timestamp>=? AND p.timestamp<?
     AND EXISTS(SELECT 1 FROM pool_snapshots earlier WHERE earlier.pool_id=p.pool_id
       AND earlier.timestamp<p.timestamp
-      AND CAST(earlier.timestamp/(CASE WHEN p.timestamp<? THEN 3600000 ELSE 300000 END) AS INTEGER)
-        =CAST(p.timestamp/(CASE WHEN p.timestamp<? THEN 3600000 ELSE 300000 END) AS INTEGER))
+    AND CAST(earlier.timestamp/(CASE WHEN p.timestamp<? THEN 1800000 ELSE 300000 END) AS INTEGER)
+        =CAST(p.timestamp/(CASE WHEN p.timestamp<? THEN 1800000 ELSE 300000 END) AS INTEGER))
     AND NOT EXISTS(SELECT 1 FROM watchlist_history w WHERE w.pool_id=p.pool_id
       AND w.added_at<=p.timestamp AND (w.removed_at IS NULL OR w.removed_at>=p.timestamp))
     AND NOT EXISTS(SELECT 1 FROM signal_episodes s WHERE s.pool_id=p.pool_id
@@ -66,11 +70,46 @@ const snapshots=db.prepare(`SELECT p.rowid id,LENGTH(p.data)+64 bytes FROM pool_
   LIMIT ?`).all(version.validFrom,now-7*86400000,now-30*86400000,now-30*86400000,limit) as {id:number;bytes:number}[];
 
 const size=statSync(env.DATABASE_PATH).size;
-const report={mode:args.has("--apply-events")||args.has("--apply-snapshots")?"APPLY":"DRY_RUN",
+const report={mode:archiveApply||args.has("--apply-events")||args.has("--apply-snapshots")?"APPLY":"DRY_RUN",
   databaseBytes:size,events:{eligibleInBatch:events.length,estimatedBytes:events.reduce((n,e)=>n+e.bytes,0)},
   snapshots:{eligibleInBatch:snapshots.length,estimatedBytes:snapshots.reduce((n,e)=>n+e.bytes,0)},
-  cappedAt:limit,notes:"Estimated bytes remain allocated until optional offline VACUUM; existing pre-Sprint-7 history is protected."};
-if(args.has("--apply-events")||args.has("--apply-snapshots")) {
+  affectedSignals:0,affectedOutcomes:0,cappedAt:limit,
+  notes:"Batch is capped at 500; estimates are not a full-table count. Deleted bytes remain allocated for SQLite reuse; pre-Sprint-7 history is protected."};
+if(archiveApply) {
+  const payload={format:"lp-scanner-archive-v1",createdAt:now,datasetVersion:"sprint7-v1",
+    snapshots:snapshots.map(({id})=>({id,row:db.prepare("SELECT * FROM pool_snapshots WHERE rowid=?").get(id)})),
+    events:events.map(({id})=>({id,row:db.prepare("SELECT * FROM fee_events WHERE rowid=?").get(id)}))};
+  if(payload.snapshots.length||payload.events.length) {
+    const plain=Buffer.from(JSON.stringify(payload));
+    const compressed=gzipSync(plain,{level:9});
+    const dir=resolve("data/archives");mkdirSync(dir,{recursive:true});
+    const archivePath=resolve(dir,`archive-${now}.json.gz`);
+    const manifestPath=`${archivePath}.manifest.json`;
+    writeFileSync(archivePath,compressed,{flag:"wx"});
+    const saved=readFileSync(archivePath);
+    const verified=verifyArchive(saved,plain,snapshots.map((r)=>r.id),events.map((r)=>r.id));
+    const manifest={format:payload.format,createdAt:now,archivePath,
+      ...verified};
+    writeFileSync(manifestPath,JSON.stringify(manifest,null,2),{flag:"wx"});
+    db.transaction(()=>{
+      const delSnapshot=db.prepare("DELETE FROM pool_snapshots WHERE rowid=?");
+      const delEvent=db.prepare("DELETE FROM fee_events WHERE rowid=?");
+      for(const item of payload.snapshots) {
+        if(JSON.stringify(db.prepare("SELECT * FROM pool_snapshots WHERE rowid=?").get(item.id))!==JSON.stringify(item.row))
+          throw new Error("Snapshot changed during archival; no rows deleted");
+        delSnapshot.run(item.id);
+      }
+      for(const item of payload.events) {
+        if(JSON.stringify(db.prepare("SELECT * FROM fee_events WHERE rowid=?").get(item.id))!==JSON.stringify(item.row))
+          throw new Error("Event changed during archival; no rows deleted");
+        delEvent.run(item.id);
+      }
+    }).immediate();
+    console.log(JSON.stringify({...report,archive:manifest,manifestPath},null,2));
+    db.close();process.exit(0);
+  }
+}
+if(!archive && (args.has("--apply-events")||args.has("--apply-snapshots"))) {
   db.transaction(()=>{
     if(args.has("--apply-events")) {
       const del=db.prepare("DELETE FROM fee_events WHERE rowid=?");

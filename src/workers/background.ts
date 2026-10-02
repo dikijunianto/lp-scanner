@@ -1,5 +1,5 @@
 import { env, researchPolicy, priorityPolicy } from "../config/env";
-import { priorityScore } from "../core/research";
+import { priorityScore,priorityTier } from "../core/research";
 import { withTraffic, type Traffic } from "../core/traffic";
 import type { Store } from "../db/store";
 import { RpcRouter } from "../adapters/rpc-router";
@@ -28,6 +28,9 @@ export class BackgroundWorker {
   }
   private async execute(traffic: Traffic) {
     const started=Date.now();
+    const disk=this.store.diskState();
+    if((this.mode==="history" && ["CRITICAL","EMERGENCY"].includes(disk)) ||
+      (this.mode==="depth" && disk==="EMERGENCY")) return;
     const runId = this.store.startWorkerRun(this.store.backfillQueueLength());
     const notes: string[] = [this.mode];
     let status = "ok";
@@ -46,11 +49,9 @@ export class BackgroundWorker {
         priorityScore(a.pool,watched.has(a.pool.id),a.metrics,priorityPolicy()));
       const sol=ranked.filter((s)=>s.pool.chain==="solana").map((s)=>s.pool);
       const base=ranked.filter((s)=>s.pool.chain==="base").map((s)=>s.pool);
-      const bsc=ranked.filter((s)=>s.pool.chain==="bsc").map((s)=>s.pool);
       const depth=await Promise.allSettled([
         sol.length?enrichMeteoraDepth(sol,new RpcRouter("solana",this.store),this.store,false,watched):Promise.resolve(""),
         base.length?enrichEvmDepth(base,new RpcRouter("base",this.store),this.store,false,watched):Promise.resolve(""),
-        bsc.length?enrichEvmDepth(bsc,new RpcRouter("bsc",this.store),this.store,false,watched):Promise.resolve(""),
       ]);
       for(const result of depth) if(result.status==="fulfilled" && result.value) notes.push(result.value);
       if(Date.now()-this.lastProbeAt>=env.RPC_PROBE_INTERVAL_SECONDS*1000) {
@@ -62,7 +63,25 @@ export class BackgroundWorker {
       }
       if(this.mode==="all"||this.mode==="history") {
       const jobs = this.store.backfillJobs(env.BACKFILL_POOLS_PER_CYCLE);
+      const signals=this.store.activeSignalIds();
+      const hotBase=this.store.list().filter((s)=>s.pool.chain==="base" &&
+        (watched.has(s.pool.id)||signals.has(s.pool.id)||
+          priorityTier(s.pool,false,s.metrics,priorityPolicy())===1));
+      const live=new Map(this.store.liveCursorHealth().map((c)=>[c.poolId,c]));
+      const baseLiveBehind=hotBase.some((s)=>{
+        const cursor=live.get(s.pool.id);
+        return !cursor || Date.now()-cursor.endTime>180000;
+      });
       for (const { job, pool } of jobs) {
+        if(job.chain==="base" && baseLiveBehind) {
+          notes.push("Base historical repair yielded to stale HOT live cursors");
+          continue;
+        }
+        if(job.chain==="bsc" && ![env.BSC_HISTORICAL_INDEXER_URL,env.BSC_ARCHIVE_RPC_URL,
+          env.BSC_LOG_RPC_URL,env.BSC_LOG_RPC_URLS,env.BSC_FEE_RPC_URL].some(Boolean)) {
+          notes.push("BSC historical logs disabled: no configured capable source");
+          continue;
+        }
         if(Date.now()-started>env.BACKGROUND_COLD_BUDGET_MS) {notes.push("Historical fees paused by background budget");break;}
         const rpc = new RpcRouter(job.chain as "base" | "bsc",this.store);
         try {

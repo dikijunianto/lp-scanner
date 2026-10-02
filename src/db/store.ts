@@ -258,6 +258,7 @@ export function createStore(path = env.DATABASE_PATH) {
         .run(poolId, data.blockId, data.updatedAt, JSON.stringify(data));
     },
     save(items: Snapshot[],tieredHistory=false) {
+      const preserveDisk=continuity.diskState()==="EMERGENCY";
       const watched=tieredHistory?research.watchedIds():new Set<string>();
       const active=tieredHistory?research.activeSignalIds():new Set<string>();
       const latest=sqlite.prepare("SELECT timestamp FROM pool_snapshots WHERE pool_id=? ORDER BY timestamp DESC LIMIT 1");
@@ -276,10 +277,9 @@ export function createStore(path = env.DATABASE_PATH) {
             .values(row)
             .onConflictDoUpdate({ target: schema.pools.id, set: row })
             .run();
-          const hot=watched.has(p.id)||active.has(p.id)||data.metrics.surge||
-            (p.volume1h??0)>=env.PRIORITY_TIER1_VOLUME_1H;
           const last=tieredHistory?(latest.get(p.id) as {timestamp:number}|undefined)?.timestamp:null;
-          if(!tieredHistory || last==null || p.timestamp-last>=(hot?300000:3600000))
+          if(!preserveDisk && (!tieredHistory || last==null || p.timestamp-last>=
+            (watched.has(p.id)||active.has(p.id)?300000:3600000)))
             tx.insert(schema.snapshots)
               .values({ poolId: p.id, timestamp: p.timestamp, data })
               .onConflictDoNothing()

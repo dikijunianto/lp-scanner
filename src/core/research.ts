@@ -128,6 +128,7 @@ export interface Outcome {
   outcomeCompletenessPct?: number;
   overallCompletenessPct?: number;
   fieldCompleteness?: Record<"price"|"range"|"fee"|"depth"|"liquidity", "COMPLETE"|"PARTIAL"|"UNAVAILABLE">;
+  completenessClasses?: ("PRICE_RANGE_COMPLETE"|"FEE_COMPLETE"|"DEPTH_COMPLETE"|"FULL_COMPLETE")[];
   missingReasons?: string[];
 }
 
@@ -266,6 +267,13 @@ export function evaluateOutcome(
     depth:group([result.depth5PctChange],result.depth5PctChange!==null),
     liquidity:group([result.activeLiquidityChange],result.activeLiquidityChange!==null),
   };
+  result.completenessClasses=[];
+  if(result.fieldCompleteness.price==="COMPLETE" && result.fieldCompleteness.range==="COMPLETE")
+    result.completenessClasses.push("PRICE_RANGE_COMPLETE");
+  if(result.fieldCompleteness.fee==="COMPLETE") result.completenessClasses.push("FEE_COMPLETE");
+  if(result.fieldCompleteness.depth==="COMPLETE") result.completenessClasses.push("DEPTH_COMPLETE");
+  if(Object.values(result.fieldCompleteness).every((value)=>value==="COMPLETE"))
+    result.completenessClasses.push("FULL_COMPLETE");
   result.overallCompletenessPct=Object.values(result.fieldCompleteness).reduce((n,v)=>
     n+(v==="COMPLETE"?100:v==="PARTIAL"?50:0),0)/5;
   result.missingReasons=outcomeMissingReasons(result);
