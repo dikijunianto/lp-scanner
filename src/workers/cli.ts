@@ -1,7 +1,7 @@
 import { createStore } from "../db/store";
-import { Scanner } from "./scanner";
+import { ScanSupervisor } from "./scan-supervisor";
 const store = createStore();
-const scanner = new Scanner(store);
+const scanner = new ScanSupervisor(store);
 try {
   await scanner.scan();
   if (store.recentRuns()[0]?.status === "error") process.exitCode = 1;

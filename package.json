@@ -9,10 +9,10 @@
   "packageManager": "pnpm@11.19.0",
   "scripts": {
     "predev": "pnpm db:migrate",
-    "dev": "concurrently -k -n api,web,core,outcomes,depth,history,economic,base,bsc \"tsx watch src/api/server.ts\" \"next dev --hostname 127.0.0.1\" \"tsx src/workers/core-writer.ts\" \"tsx src/workers/service.ts outcomes\" \"tsx src/workers/service.ts depth\" \"tsx src/workers/service.ts history\" \"tsx src/workers/service.ts economic\" \"tsx src/workers/service.ts live-base\" \"tsx src/workers/service.ts live-bsc\"",
+    "dev": "concurrently -k -n api,web,core,outcomes,depth,history,economic,base,bsc,scanner,diagnostics \"tsx watch src/api/server.ts\" \"next dev --hostname 127.0.0.1\" \"tsx src/workers/core-writer.ts\" \"tsx src/workers/service.ts outcomes\" \"tsx src/workers/service.ts depth\" \"tsx src/workers/service.ts history\" \"tsx src/workers/service.ts economic\" \"tsx src/workers/service.ts live-base\" \"tsx src/workers/service.ts live-bsc\" \"tsx src/workers/service.ts scanner\" \"tsx src/workers/service.ts diagnostics\"",
     "build": "next build",
     "prestart": "pnpm db:migrate",
-    "start": "concurrently -k -n api,web,core,outcomes,depth,history,economic,base,bsc \"tsx src/api/server.ts\" \"next start --hostname 127.0.0.1\" \"tsx src/workers/core-writer.ts\" \"tsx src/workers/service.ts outcomes\" \"tsx src/workers/service.ts depth\" \"tsx src/workers/service.ts history\" \"tsx src/workers/service.ts economic\" \"tsx src/workers/service.ts live-base\" \"tsx src/workers/service.ts live-bsc\"",
+    "start": "concurrently -k -n api,web,core,outcomes,depth,history,economic,base,bsc,scanner,diagnostics \"tsx src/api/server.ts\" \"next start --hostname 127.0.0.1\" \"tsx src/workers/core-writer.ts\" \"tsx src/workers/service.ts outcomes\" \"tsx src/workers/service.ts depth\" \"tsx src/workers/service.ts history\" \"tsx src/workers/service.ts economic\" \"tsx src/workers/service.ts live-base\" \"tsx src/workers/service.ts live-bsc\" \"tsx src/workers/service.ts scanner\" \"tsx src/workers/service.ts diagnostics\"",
     "test": "vitest run",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
@@ -22,7 +22,9 @@
     "storage:archive": "tsx src/workers/retention.ts --archive",
     "dataset:freeze": "tsx src/workers/dataset-freeze.ts",
     "core-writer": "tsx src/workers/core-writer.ts",
-    "burnin": "tsx src/workers/burnin.ts"
+    "burnin": "tsx src/workers/burnin.ts",
+    "burnin:24h": "tsx src/workers/burnin.ts --hours=24 --keep-awake",
+    "storage:compact": "tsx src/workers/retention.ts --archive"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

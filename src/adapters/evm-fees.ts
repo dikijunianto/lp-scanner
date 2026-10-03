@@ -10,6 +10,7 @@ import type { BackfillJob } from "../db/research";
 import { blockSchema, ReadOnlyRpc } from "./liquidity-rpc";
 import { RpcRouter, isRangeError } from "./rpc-router";
 import { fetchIndexedSwaps, reconcileSwapLogs } from "./log-sources";
+import { getV3FeeMetadata } from "./evm-liquidity";
 type Block = { hash: string; timestamp: number };
 export const liveCursorNeedsRestart = (cursorEndTime:number,updatedAt:number,
   confirmedTime:number,now=Date.now()) => confirmedTime-cursorEndTime>600000 && now-updatedAt>600000;
@@ -182,7 +183,8 @@ export async function readRange(
       });
     }
   }
-  const details = pool.activeLiquidityDetails!;
+  const details = getV3FeeMetadata(pool);
+  if (!details) throw new Error("Pool lacks current V3 metadata");
   const events: FeeEventRow[] = [];
   for (const log of logs) {
     const swap = decodeSwap(log),
@@ -208,7 +210,7 @@ export async function readRange(
       details.decimals1,
       p0?.priceUsd ?? null,
       p1?.priceUsd ?? null,
-      pool.feeTier!,
+      details.feeTier,
       swap.protocolFeeRaw,
     );
     events.push({
@@ -228,7 +230,7 @@ export async function readRange(
       grossFeeUsd: amount.volumeUsd === null ? null : amount.volumeUsd * pool.feeTier!,
       lpFeeUsd: amount.feesUsd,
       feesUsd: amount.feesUsd,
-      feeTier: pool.feeTier,
+      feeTier: details.feeTier,
       protocolFeeRaw: swap.protocolFeeRaw?.toString() ?? null,
       priceConfidence: (swap.amount0 > 0n ? p0 : p1)?.confidence ?? "UNAVAILABLE",
       sender: `0x${log.topics[1].slice(-40)}`.toLowerCase(),
@@ -278,8 +280,7 @@ export async function indexEvmFeeJob(
   store: Store,
   watched = false,
 ) {
-  if (pool.activeLiquidityDetails?.method !== "V3_VIRTUAL_RESERVES_V1" || pool.feeTier === null)
-    throw new Error("Pool lacks current V3 metadata");
+  if (!getV3FeeMetadata(pool)) throw new Error("Pool lacks current V3 metadata");
   if (!store.hasFeeBuckets(pool.id) && store.feeCursor(pool.id)) store.rebuildFeeBuckets(pool.id);
   const head = blockSchema.parse(await rpc.call("eth_getBlockByNumber", ["latest", false]));
   if (!fresh(Number(BigInt(head.timestamp)) * 1000, Date.now(), 120000))
@@ -375,8 +376,7 @@ export async function indexEvmFeeJob(
 
 // A separate contiguous cursor keeps recent windows moving even while older history is missing.
 export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
-  if (pool.activeLiquidityDetails?.method !== "V3_VIRTUAL_RESERVES_V1" || pool.feeTier === null)
-    throw new Error("Pool lacks current V3 metadata");
+  if (!getV3FeeMetadata(pool)) throw new Error("Pool lacks current V3 metadata");
   const head=blockSchema.parse(await rpc.call("eth_getBlockByNumber",["latest",false]));
   const headBlock=Number(BigInt(head.number));
   const headTime=Number(BigInt(head.timestamp))*1000;
@@ -390,9 +390,7 @@ export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
     if (current.hash.toLowerCase()!==cursor.blockHash.toLowerCase()) {
       store.rollbackIndexedFees(pool.id,cursor.startBlock);
       cursor=null;
-    } else if (liveCursorNeedsRestart(cursor.endTime,cursor.updatedAt,confirmed.timestamp)) {
-      store.resetLiveFeeCursor(pool.id);
-      cursor=null;
+
     }
   }
   if(cursor && cursor.blockNumber>confirmedBlock) throw new Error("LIVE_RPC_BEHIND_CURSOR");
@@ -400,11 +398,15 @@ export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
   const from=cursor ? cursor.blockNumber+1 : Math.max(0,confirmedBlock-bootstrap);
   const to=Math.min(confirmedBlock,from+env.LIVE_MAX_BLOCKS_PER_JOB-1);
   if (from>to) return {indexed:0,cursor,headBlock,headTime,status:"CURRENT"};
-  const batch=await readRange(pool,rpc,store,from,to,"LIVE");
+  let adaptiveTo=to,batch;
+  while(true){try{batch=await readRange(pool,rpc,store,from,adaptiveTo,"LIVE");break;}
+    catch(error){if(!isRangeError(error instanceof Error?error.message:String(error)) || adaptiveTo<=from)throw error;
+      adaptiveTo=from+Math.floor((adaptiveTo-from)/2);}}
+
   if(!cursor && prior && from>prior.blockNumber+1)
     store.recordFeeGap(pool.id,prior.blockNumber+1,from-1,prior.endTime,batch.first.timestamp,
       "LIVE_CURSOR_RESTART");
-  store.saveLiveFeeBatch(pool.id,pool.chain,batch.events,from,batch.first.timestamp,to,batch.last.hash,
+  store.saveLiveFeeBatch(pool.id,pool.chain,batch.events,from,batch.first.timestamp,adaptiveTo,batch.last.hash,
     batch.last.timestamp,headBlock,headTime,batch.sourceType,batch.sourceId);
   cursor=store.liveFeeCursor(pool.id);
   if (!cursor) throw new Error("Live fee cursor not saved");

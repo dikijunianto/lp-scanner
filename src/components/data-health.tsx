@@ -7,11 +7,13 @@ type Provider = {providerId:string;chain:string;providerType:string;supportsArch
   supportsHistoricalState:boolean|null;healthState:string;safeLogRange:number;latencyMs:number|null;
   errorRate:number;lastSuccessAt:number|null;lastFailureAt:number|null};
 type Row = Record<string, string | number | null>;
-type Health = {generatedAt:number;providers:Provider[];usage:Row[];priceCalls:Row[];coverage:Row[];currentFees:Row[];
+type Health = {summaryAgeMs:number;summaryStale:boolean;
+  hotPoolDetails:{poolId:string;chain:string;priced:boolean;depth:boolean;feeComplete:boolean;activity:string;fresh:boolean;lagSeconds:number|null;reason:string;priceTokens:{address:string;symbol:string;reliable:boolean;failures:string[];provenance:unknown}[]}[];
+  generatedAt:number;providers:Provider[];usage:Row[];priceCalls:Row[];coverage:Row[];currentFees:Row[];
   bscSource:{liveLogs:boolean;historicalLogs:boolean;archiveState:boolean;websocket:string};
   readiness:{status:string;selectedChains:string[];failed:string[];gates:{id:string;value:number|null;target:number;pass:boolean}[];
     bsc:{status:string;failed:string[]}};
-  hotCoverage:{chain:string;pools:number;priced:number;depth5:number;fee1h:number}[];
+  hotCoverage:{chain:string;pools:number;priced:number;depth5:number;fee1h:number;activePools:number;activeFee1h:number;activeFresh:number}[];
   snapshotCoverage:{tracked:number;maturePools:number;expected:number;actual:number;priced:number;
     fees:number;depth:number;coveragePct:number|null;priceCoveragePct:number|null;
     feeCoveragePct:number|null;depthCoveragePct:number|null;largestGapMs:number|null};
@@ -59,7 +61,7 @@ export function DataHealthPage() {
     if (data && !data.providers.some((p)=>p.chain===chain && p.supportsGetLogs && p.healthState==="HEALTHY") &&
       !data.eventSources.some((s)=>s.chain===chain && s.healthState==="HEALTHY"))
       alerts.push(`${chain.toUpperCase()} historical log RPC unavailable`);
-  if (data?.scan && data.scan.duration_ms > 25000) alerts.push("Foreground scan exceeded 25 seconds");
+  if (data?.scan && data.scan.duration_ms > 15000) alerts.push("Foreground scan exceeded 15 seconds");
   if (data?.oldestJob.oldest && data.generatedAt-data.oldestJob.oldest>3600000)
     alerts.push("Fee backfill queue has jobs older than one hour");
   if (data?.outcomePipeline.some((r)=>(r.oldestReadyAgeMs??0)>1800000))
@@ -75,6 +77,7 @@ export function DataHealthPage() {
     <p>Provider errors and missing prices remain separate from genuine data gaps. Provider URLs and credentials never appear here.</p>
     <nav className="research-nav"><Link href="/research/summary">Research summary</Link>
       <Link href="/research/coverage">Coverage</Link><Link href="/diagnostics/reliability">Reliability</Link></nav>
+    {data && <p>Summary age: {Math.round(data.summaryAgeMs/1000)} seconds · {data.summaryStale?'STALE — coverage is not current':'CURRENT'}.</p>}
     {error && <div className="warning" role="alert">{error}</div>}
     {alerts.length>0 && <section className="panel"><div className="eyebrow">INFRASTRUCTURE ALERTS</div>
       <ul>{alerts.map((a)=><li key={a}>{a}</li>)}</ul></section>}
@@ -125,7 +128,7 @@ export function DataHealthPage() {
         {data?` over ${data.measuredStorageGrowth.hours.toFixed(1)} hours`:""} ·
         timestamp-based row estimate: {data?.storageGrowth.estimatedBytesPerDay==null?"Unavailable":
           `${(data.storageGrowth.estimatedBytesPerDay/2**30).toFixed(2)} GiB/day`}.
-        Readiness uses measured table and index pages after four hours.</p></section>
+        Readiness requires 24 hours of measured total allocation, including indexes and WAL.</p></section>
     <section className="panel"><div className="eyebrow">HOT-POOL CURRENT COVERAGE</div>
       <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>HOT POOLS</th><th>RELIABLY PRICED</th>
         <th>±5% DEPTH</th><th>CURRENT 1H FEES</th></tr></thead><tbody>
@@ -133,6 +136,14 @@ export function DataHealthPage() {
           <td>{r.priced}</td><td>{r.depth5}</td><td>{r.fee1h}</td></tr>)}</tbody></table></div>
       <p>Independent live workers: {(data?.liveRuns??[]).map((r)=>
         `${r.chain} ${r.status}, ${r.swaps} swaps/${r.pools} pools${r.error?` (${r.error})`:""}`).join(" · ")||"Starting"}</p></section>
+    <section className="panel"><div className="eyebrow">HOT ACTIVE COVERAGE</div>
+      <p>{(data?.hotCoverage??[]).map(r=>`${r.chain}: all HOT ${r.pools}; active or missing ${r.activePools}; fresh cursors ${r.activeFresh}/${r.activePools}; complete 1h fees ${r.activeFee1h}/${r.activePools}`).join(' · ')}. Only proven NO_ACTIVITY pools leave the active denominator.</p>
+      <div className="table-scroll"><table><thead><tr><th>POOL</th><th>ACTIVITY</th><th>CURSOR</th><th>LAG</th><th>PRICE</th><th>DEPTH</th><th>TOKEN PRICE EVIDENCE</th></tr></thead><tbody>
+        {(data?.hotPoolDetails??[]).filter(r=>['base','solana'].includes(r.chain)).map(r=><tr key={r.poolId}>
+          <td>{r.chain} {r.poolId.slice(-12)}</td><td>{r.activity}</td><td>{r.reason}</td><td>{r.lagSeconds==null?'Unavailable':`${Math.round(r.lagSeconds)}s`}</td>
+          <td>{r.priced?'Reliable':'Unavailable'}</td><td>{r.depth?'Current':'Unavailable'}</td>
+          <td>{r.priceTokens.map(t=>`${t.symbol||t.address.slice(-8)}: ${t.reliable?'reliable':t.failures.join(', ')||'UNKNOWN'}${t.provenance?' · provenance recorded':''}`).join(' · ')}</td>
+        </tr>)}</tbody></table></div></section>
     <section className="panel"><div className="eyebrow">BSC SOURCE CAPABILITIES</div>
       <p>Live logs: {data?.bscSource.liveLogs?"YES":"NO"} · Historical logs: {data?.bscSource.historicalLogs?"YES":"NO"} ·
         Archive state: {data?.bscSource.archiveState?"YES":"NO"} · WebSocket: {data?.bscSource.websocket??"DISABLED"}.</p>

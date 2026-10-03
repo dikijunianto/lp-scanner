@@ -71,7 +71,7 @@ export function createLiveRecoveryStore(sqlite: Database.Database, databasePath:
       const signal=sqlite.prepare("SELECT MAX(episode_last_seen) at FROM signal_episodes WHERE pool_id=?")
         .get(poolId) as {at:number|null};
       const outcome=sqlite.prepare(`SELECT MAX(o.completed_at) at FROM signal_outcomes o
-        JOIN signal_episodes s ON s.id=o.signal_id WHERE s.pool_id=? AND o.status IN ('COMPLETE','PARTIAL')`)
+        JOIN signal_episodes s ON s.id=o.signal_id WHERE s.pool_id=? AND o.status IN ('COMPLETE','PARTIAL','PRICE_RANGE_COMPLETE')`)
         .get(poolId) as {at:number|null};
       return {poolId,priceFreshness,
         feeFreshness:feeWindow?.methodology==="EVENT_DERIVED"?freshness(feeWindow.windowEnd,now,180000,600000):"UNAVAILABLE",
