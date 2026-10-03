@@ -7,3 +7,7 @@ Warmup waits for a healthy read-only app and fresh materialized diagnostics befo
 Every hour must arrive within2min of its scheduled boundary and contain continuous healthy minute samples. Missed checkpoints are unhealthy evidence, never backfilled as healthy. Wall/monotonic discrepancies and clock events remain in the report. Completed stability PASS is distinct from readinessREADY. An interrupted or shorter run isFAIL and cannot satisfy observation24h.
 
 After completion inspect every failed scan, compare all denominators, stop production services, run fullSQLite integrity/ANALYZE/safe checkpoint, restart production and verify read-only health/UI. Freeze only if fresh complete readinessV3 passes. Final evidence must report all27 metrics in the Sprint9 request; until then24h results remainPENDING. No software changes/restarts during the clean window; any necessary repair remains documented and requires a new separately identified full run without erasing the failed run.
+
+## Running validation
+
+Committed implementation6141b96 started the actual clean window on3October2026 at20:09:54 WIB, expected completion4October20:09:54 WIB. Local report:reports/burnin-2026-10-03T13-09-15-803Z.json. Keep-awake process17627 tracks launcher17618. Initial saved minute samples arehealthy and read-only. Hourly evidence and finalmetrics remainPENDING; no readiness claim ornewdatasetfreeze. Temporary hourly follow-up checks will stay quiet while healthy and finish the authorized checks/report aftercompletion. DraftPR8 is stacked onSprint8PR7.
