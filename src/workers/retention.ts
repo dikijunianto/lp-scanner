@@ -1,13 +1,14 @@
 import "dotenv/config";
 import Database from "better-sqlite3";
 import { gzipSync } from "node:zlib";
-import { mkdirSync,readFileSync,statSync,writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync,mkdirSync,readFileSync,statSync,writeFileSync } from "node:fs";
+import { dirname,resolve } from "node:path";
 import { env } from "../config/env";
 import { verifyArchive } from "../core/archive";
 
 const args=new Set(process.argv.slice(2));
-const archive=args.has("--archive"),archiveApply=archive && args.has("--apply");
+const archive=args.has("--archive"),archiveApply=archive && (args.has("--apply")||args.has("--execute"));
+if(args.has("--apply-events")||args.has("--apply-snapshots")) throw new Error("Use storage:compact --execute with verified archive; unarchived deletion disabled");
 const daysArg=process.argv.find((arg)=>arg.startsWith("--event-days="));
 const eventDays=daysArg?Number(daysArg.split("=")[1]):30;
 if(!Number.isInteger(eventDays)||eventDays<30) throw new Error("--event-days must be at least 30");
@@ -46,7 +47,7 @@ const events=db.prepare(`SELECT e.rowid id,LENGTH(e.tx_hash)+LENGTH(e.amount0)+L
     AND NOT EXISTS(SELECT 1 FROM signal_episodes s WHERE s.pool_id=e.pool_id
       AND s.episode_start BETWEEN e.timestamp-86400000 AND e.timestamp+86400000)
     AND NOT EXISTS(SELECT 1 FROM signal_outcomes o JOIN signal_episodes s ON s.id=o.signal_id
-      WHERE s.pool_id=e.pool_id AND o.status NOT IN ('COMPLETE','PARTIAL','UNAVAILABLE'))
+      WHERE s.pool_id=e.pool_id AND o.status NOT IN ('COMPLETE','PARTIAL','PRICE_RANGE_COMPLETE','UNAVAILABLE'))
     AND NOT EXISTS(SELECT 1 FROM (SELECT '5m' name,300000 ms UNION ALL SELECT '30m',1800000
       UNION ALL SELECT '1h',3600000 UNION ALL SELECT '4h',14400000 UNION ALL SELECT '24h',86400000) w
       WHERE NOT EXISTS(SELECT 1 FROM fee_windows f WHERE f.pool_id=e.pool_id AND f.window_name=w.name
@@ -66,11 +67,16 @@ const snapshots=db.prepare(`SELECT p.rowid id,LENGTH(p.data)+64 bytes FROM pool_
     AND NOT EXISTS(SELECT 1 FROM signal_episodes s WHERE s.pool_id=p.pool_id
       AND s.episode_start BETWEEN p.timestamp-86400000 AND p.timestamp+86400000)
     AND NOT EXISTS(SELECT 1 FROM signal_outcomes o JOIN signal_episodes s ON s.id=o.signal_id
-      WHERE s.pool_id=p.pool_id AND o.status NOT IN ('COMPLETE','PARTIAL','UNAVAILABLE'))
+      WHERE s.pool_id=p.pool_id AND o.status NOT IN ('COMPLETE','PARTIAL','PRICE_RANGE_COMPLETE','UNAVAILABLE'))
   LIMIT ?`).all(version.validFrom,now-7*86400000,now-30*86400000,now-30*86400000,limit) as {id:number;bytes:number}[];
 
 const size=statSync(env.DATABASE_PATH).size;
-const report={mode:archiveApply||args.has("--apply-events")||args.has("--apply-snapshots")?"APPLY":"DRY_RUN",
+let archiveParent=resolve(env.ARCHIVE_PATH);
+while(!existsSync(archiveParent) && dirname(archiveParent)!==archiveParent)archiveParent=dirname(archiveParent);
+const sameFilesystem=statSync(archiveParent).dev===statSync(env.DATABASE_PATH).dev;
+const report={archivePath:resolve(env.ARCHIVE_PATH),sameFilesystem,
+  archiveWarning:sameFilesystem?'Archives share the active database filesystem; archival does not create disk runway.':null,
+  mode:archiveApply||args.has("--apply-events")||args.has("--apply-snapshots")?"APPLY":"DRY_RUN",
   databaseBytes:size,events:{eligibleInBatch:events.length,estimatedBytes:events.reduce((n,e)=>n+e.bytes,0)},
   snapshots:{eligibleInBatch:snapshots.length,estimatedBytes:snapshots.reduce((n,e)=>n+e.bytes,0)},
   affectedSignals:0,affectedOutcomes:0,cappedAt:limit,
@@ -82,7 +88,7 @@ if(archiveApply) {
   if(payload.snapshots.length||payload.events.length) {
     const plain=Buffer.from(JSON.stringify(payload));
     const compressed=gzipSync(plain,{level:9});
-    const dir=resolve("data/archives");mkdirSync(dir,{recursive:true});
+    const dir=resolve(env.ARCHIVE_PATH);mkdirSync(dir,{recursive:true});
     const archivePath=resolve(dir,`archive-${now}.json.gz`);
     const manifestPath=`${archivePath}.manifest.json`;
     writeFileSync(archivePath,compressed,{flag:"wx"});

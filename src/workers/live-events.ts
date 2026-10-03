@@ -4,6 +4,8 @@ import type { Store } from "../db/store";
 import { indexLiveEvmFees } from "../adapters/evm-fees";
 import { RpcRouter } from "../adapters/rpc-router";
 import { BscWsSource } from "../adapters/bsc-ws";
+import {enrichEvmLiquidity} from "../adapters/evm-liquidity";
+import {staleCursorReason} from "../core/live-health";
 
 // One independent loop per EVM chain: historical jobs never occupy a live slot.
 export class LiveEventWorker {
@@ -61,22 +63,31 @@ export class LiveEventWorker {
     }
     const watched=this.store.watchedIds(),active=this.store.activeSignalIds();
     const ranked=this.store.list().filter((s)=>s.pool.chain===this.chain &&
-      s.pool.activeLiquidityDetails?.method==="V3_VIRTUAL_RESERVES_V1" &&
+      ["uniswap-v3","pancakeswap-v3"].includes(s.pool.protocol) &&
       (watched.has(s.pool.id)||active.has(s.pool.id)||
         priorityTier(s.pool,false,s.metrics,priorityPolicy())===1) &&
       (this.retryAt.get(s.pool.id)??0)<=started).map((s)=>({s,cursor:this.store.liveFeeCursor(s.pool.id)}));
     const score=(x:(typeof ranked)[number])=>priorityScore(x.s.pool,watched.has(x.s.pool.id),
       x.s.metrics,priorityPolicy())+(active.has(x.s.pool.id)?1000:0)+
       (x.cursor?Math.min(5000,Math.max(0,started-x.cursor.updatedAt)/40):5000);
-    ranked.sort((a,b)=>score(b)-score(a));
+    ranked.sort((a,b)=>(a.cursor?.updatedAt??0)-(b.cursor?.updatedAt??0) || score(b)-score(a));
     const selected=ranked.slice(0,env.LIVE_POOLS_PER_CYCLE);
     const results=await Promise.all(selected.map(async({s})=>{
       try {
-        const result=await indexLiveEvmFees(s.pool,new RpcRouter(this.chain,this.store),this.store);
+        const rpc=new RpcRouter(this.chain,this.store);
+        if(!s.pool.activeLiquidityDetails)await enrichEvmLiquidity([s.pool],this.chain,rpc);
+        const result=await indexLiveEvmFees(s.pool,rpc,this.store);
+        const window=this.store.latestFeeWindows(s.pool.id)['1h'];
+        this.store.recordLivePoolHealth(s.pool.id,staleCursorReason({fresh:result.status==='CURRENT',
+          headAgeSeconds:(Date.now()-result.headTime)/1000,lagSeconds:result.cursor?(Date.now()-result.cursor.endTime)/1000:null,
+          updatedAgeSeconds:0,covered:window?.continuityState==='COMPLETE',swaps:window?.swapCount??null}),null,result.indexed);
         this.retryAt.delete(s.pool.id);
         return {swaps:result.indexed,error:null};
       } catch(e) {
-        this.retryAt.set(s.pool.id,Date.now()+60000);
+        const message=e instanceof Error?e.message:"Live ingestion unavailable";
+        this.store.recordLivePoolHealth(s.pool.id,staleCursorReason({fresh:false,headAgeSeconds:0,
+          lagSeconds:null,updatedAgeSeconds:0,error:message,covered:false,swaps:null}),message,null);
+        this.retryAt.set(s.pool.id,Date.now()+(/budget|429|rate/i.test(message)?60000:15000));
         return {swaps:0,error:e instanceof Error?e.message:"Live ingestion unavailable"};
       }
     }));

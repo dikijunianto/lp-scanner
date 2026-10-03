@@ -40,11 +40,12 @@ export class BackgroundWorker {
       const outcomes = await this.store.evaluateDueOutcomes(researchPolicy(),Date.now(),
         env.OUTCOME_JOBS_PER_CYCLE,env.OUTCOME_WORKER_CONCURRENCY);
       if (outcomes) notes.push(`${outcomes} outcomes evaluated`);
-      if(outcomes<env.OUTCOME_JOBS_PER_CYCLE)
+      if(disk!=="EMERGENCY" && outcomes<env.OUTCOME_JOBS_PER_CYCLE)
         notes.push(`${this.store.requeueOutcomeFieldBackfill(20)} old outcome fields queued`);
       }
       if(this.mode==="all"||this.mode==="depth") {
-      const snapshots = this.store.list();
+      const protectedSignals=this.store.activeSignalIds();
+      const snapshots = this.store.list().filter(s=>disk!=="CRITICAL" || watched.has(s.pool.id) || protectedSignals.has(s.pool.id) || priorityTier(s.pool,false,s.metrics,priorityPolicy())===1);
       const ranked=snapshots.sort((a,b)=>priorityScore(b.pool,watched.has(b.pool.id),b.metrics,priorityPolicy())-
         priorityScore(a.pool,watched.has(a.pool.id),a.metrics,priorityPolicy()));
       const sol=ranked.filter((s)=>s.pool.chain==="solana").map((s)=>s.pool);

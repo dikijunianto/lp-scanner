@@ -40,6 +40,34 @@ const selectors = [
   "0xc45a0155",
 ];
 const decimalsCache = new Map<string, { value: number; until: number }>();
+export interface V3FeeMetadata {
+  token0Address: string;
+  token1Address: string;
+  decimals0: number;
+  decimals1: number;
+  feeTier: number;
+  blockNumber: string;
+  blockTime: number;
+}
+// Fee ingestion needs validated token units and fee tier, independently of USD valuation.
+// Object lifetime bounds this cache; metadata never makes USD liquidity available.
+const feeMetadata = new WeakMap<Pool, V3FeeMetadata>();
+export function getV3FeeMetadata(pool: Pool): V3FeeMetadata | null {
+  const captured = feeMetadata.get(pool);
+  if (captured) return captured;
+  const details = pool.activeLiquidityDetails;
+  if (details?.method !== "V3_VIRTUAL_RESERVES_V1" || pool.feeTier == null ||
+      !Number.isFinite(pool.feeTier) || pool.feeTier < 0 || pool.feeTier >= 1) return null;
+  const addresses = [pool.token0Address.toLowerCase(), pool.token1Address.toLowerCase()];
+  if (details.token0Address.toLowerCase() === details.token1Address.toLowerCase() ||
+      !addresses.includes(details.token0Address.toLowerCase()) ||
+      !addresses.includes(details.token1Address.toLowerCase())) return null;
+  try { decimals(details.decimals0); decimals(details.decimals1); } catch { return null; }
+  return { token0Address: details.token0Address, token1Address: details.token1Address,
+    decimals0: details.decimals0, decimals1: details.decimals1, feeTier: pool.feeTier,
+    blockNumber: details.block, blockTime: details.blockTime };
+}
+
 export const multicallAbi = new Interface([
   "function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) payable returns (tuple(bool success,bytes returnData)[] returnData)",
 ]);
@@ -84,6 +112,7 @@ export async function enrichEvmLiquidity(
   const started = Date.now();
   const network = evmNetworks[chain];
   const targets = pools.slice(0, env.ACTIVE_LIQUIDITY_EVM_LIMIT);
+  for (const pool of pools) feeMetadata.delete(pool);
   for (const p of pools)
     unavailableLiquidity(
       p,
@@ -194,6 +223,9 @@ export async function enrichEvmLiquidity(
         pool.feeTier = state.fee / 1e6;
         pool.tickSpacing = state.spacing;
         const amounts = v3VirtualAmounts(state.liquidity, state.sqrt, state.tick, d0, d1);
+        feeMetadata.set(pool, { token0Address: state.token0, token1Address: state.token1,
+          decimals0: d0, decimals1: d1, feeTier: state.fee / 1e6,
+          blockNumber: block.number, blockTime });
         const pricing = priceEvidence(
           t0,
           t1,

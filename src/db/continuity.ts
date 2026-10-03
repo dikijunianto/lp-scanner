@@ -4,6 +4,8 @@ import type Database from "better-sqlite3";
 import { env } from "../config/env";
 import type { Pool,Snapshot } from "../core/model";
 import type { ScanSpan } from "../core/traffic";
+import {sampleTrace} from "../core/clock";
+import {staleCursorReason} from "../core/live-health";
 
 const minute = 60_000;
 export function diskMode(freeBytes:number) {
@@ -26,6 +28,56 @@ export interface CoreSnapshotRow {
 }
 export function createContinuityStore(sqlite:Database.Database,databasePath:string) {
   return {
+    burninContext() {
+      const row=sqlite.prepare("SELECT value FROM app_settings WHERE key='burninContext'").get() as {value:string}|undefined;
+      return row?JSON.parse(row.value) as {startedAt:number;finishedAt?:number;id:string}:null;
+    },
+    hourlyCheckpoints() {
+      const id=sqlite.prepare("SELECT burnin_id id FROM hourly_slo_checkpoints ORDER BY observed_at DESC LIMIT 1").get() as {id:string}|undefined;
+      return id?sqlite.prepare("SELECT data FROM hourly_slo_checkpoints WHERE burnin_id=? ORDER BY hour").all(id.id).map(r=>{const slo=JSON.parse((r as {data:string}).data);delete slo.data;delete slo.storage;delete slo.scans;return slo;}):[];
+    },
+    scanWindow(from:number,to=Date.now()) {
+      const rows=sqlite.prepare("SELECT duration_ms ms,deadline_breached breached FROM scan_traces WHERE started_at BETWEEN ? AND ? ORDER BY duration_ms").all(from,to) as {ms:number;breached:number}[];
+      const q=(p:number)=>rows.length?rows[Math.ceil(rows.length*p)-1].ms:null;
+      return {count:rows.length,medianMs:q(.5),p95Ms:q(.95),p99Ms:q(.99),maxMs:q(1),breaches:rows.reduce((n,r)=>n+r.breached,0)};
+    },
+    diagnosticSummary() {
+      const row=sqlite.prepare("SELECT updated_at at,data FROM diagnostic_summaries WHERE id='current'").get() as {at:number;data:string}|undefined;
+      return row?{updatedAt:row.at,data:JSON.parse(row.data) as Record<string,unknown>}:null;
+    },
+    saveDiagnosticSummary(data:unknown,at:number) {
+      sqlite.prepare("INSERT OR REPLACE INTO diagnostic_summaries VALUES ('current',?,?)").run(at,JSON.stringify(data));
+    },
+    saveScanTrace(id:number,start:number,end:number,duration:number,monotonic:number,deadline:number,breached:boolean,error:string|null) {
+      sqlite.prepare("INSERT OR REPLACE INTO scan_traces VALUES (?,?,?,?,?,?,?,?)").run(id,start,end,duration,monotonic,deadline,Number(breached),error);
+      sqlite.prepare("UPDATE scan_metrics SET duration_ms=? WHERE run_id=?").run(duration,id);
+      sqlite.prepare("UPDATE scanner_runs SET ended_at=? WHERE id=?").run(end,id);
+    },
+    scanTrace(id:number) {
+      return {root:sqlite.prepare("SELECT * FROM scan_traces WHERE run_id=?").get(id)??null,
+        children:sqlite.prepare("SELECT * FROM scan_phase_spans WHERE run_id=? ORDER BY started_at").all(id)};
+    },
+    keepScanTrace(id:number,elapsed:number,failed:boolean) {
+      return !['CRITICAL','EMERGENCY'].includes(this.diskState()) && sampleTrace(id,env.TRACE_NORMAL_SAMPLE_RATE,elapsed,failed,env.TRACE_SLOW_MS);
+    },
+    saveClockEvent(at:number,event:string,wall:number,monotonic:number) {
+      sqlite.prepare("INSERT OR IGNORE INTO system_clock_events VALUES (?,?,?,?)").run(at,event,wall,monotonic);
+    },
+    clockEvents(from:number,to:number) {
+      return sqlite.prepare("SELECT * FROM system_clock_events WHERE detected_at BETWEEN ? AND ? ORDER BY detected_at").all(from,to);
+    },
+    recordLivePoolHealth(poolId:string,reason:string,error:string|null,swaps:number|null) {
+      sqlite.prepare("INSERT OR REPLACE INTO live_pool_health VALUES (?,?,?,?,?)").run(poolId,Date.now(),reason,error?.slice(0,200)??null,swaps);
+    },
+    livePoolHealth() {return sqlite.prepare("SELECT * FROM live_pool_health").all();},
+    pruneTraces(now=Date.now()) {
+      // Bounded raw trace removal only; historical pool/signal data and scan aggregates remain.
+      const removed=sqlite.prepare("DELETE FROM scan_phase_spans WHERE rowid IN (SELECT rowid FROM scan_phase_spans WHERE ended_at<? LIMIT 1000)")
+        .run(now-env.TRACE_RETENTION_HOURS*3600000).changes;
+      const slow=sqlite.prepare("DELETE FROM scan_slow_calls WHERE rowid IN (SELECT c.rowid FROM scan_slow_calls c JOIN scanner_runs r ON r.id=c.run_id WHERE r.started_at<? LIMIT 1000)").run(now-env.TRACE_RETENTION_HOURS*3600000).changes;
+      sqlite.prepare("UPDATE worker_runs SET notes='RAW_DEBUG_EXPIRED' WHERE id IN (SELECT id FROM worker_runs WHERE ended_at<? AND notes<>'RAW_DEBUG_EXPIRED' LIMIT 1000)").run(now-env.TRACE_RETENTION_HOURS*3600000);
+      return removed+slow;
+    },
     recordScanSkipped() {
       sqlite.prepare(`INSERT INTO app_settings(key,value) VALUES ('scanSkippedBecausePreviousRunning','1')
         ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1`).run();
@@ -58,10 +110,10 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
     },
     recordScanSpans(runId:number,spans:ScanSpan[]) {
       const insert=sqlite.prepare(`INSERT OR IGNORE INTO scan_phase_spans
-        (run_id,phase,operation,provider,started_at,ended_at,duration_ms,timeout_ms,success)
-        VALUES (?,?,?,?,?,?,?,?,?)`);
+        (run_id,phase,operation,provider,started_at,ended_at,duration_ms,timeout_ms,success,aborted,error_class,monotonic_ms)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
       sqlite.transaction(()=>{for(const s of spans) insert.run(runId,s.phase,s.operation,s.provider,
-        s.startedAt,s.endedAt,s.durationMs,s.timeoutMs,s.success?1:0);})();
+        s.startedAt,s.endedAt,s.durationMs,s.timeoutMs,s.success?1:0,Number(s.aborted??false),s.errorClass??null,s.monotonicMs??null);})();
     },
     recentScanSpans(limit=80) {
       return sqlite.prepare(`SELECT run_id runId,phase,operation,provider,started_at startedAt,
@@ -158,7 +210,10 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.volume1h') END,
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.fees1h') END,
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.activeLiquidityUsd') END,
-          CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.depth5PctUsd') END,
+          CASE WHEN p.updated_at>=? AND json_extract(p.data,'$.pool.depthState')='CURRENT'
+            AND json_extract(p.data,'$.pool.depthExpiresAt')>=${at}
+            AND json_extract(p.data,'$.pool.depthConfidence') IN ('HIGH','MEDIUM')
+            THEN json_extract(p.data,'$.pool.depth5PctUsd') END,
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.realizedVolatility1h') END,
           'sprint8-core-v2'
         FROM pools p WHERE ${hotWhere}`).run(at,...Array(9).fill(freshAfter),env.PRIORITY_TIER1_VOLUME_1H).changes;
@@ -171,10 +226,9 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
         FROM core_snapshots WHERE pool_id=? AND timestamp>? AND timestamp<=? AND price IS NOT NULL
         ORDER BY timestamp`).all(poolId,from,to) as CoreSnapshotRow[];
     },
-    coreSnapshotCoverage(now=Date.now(),windowMs=4*3600000) {
+    coreSnapshotCoverage(now=Date.now(),windowMs=4*3600000,selected=false) {
       const at=Math.floor(now/minute)*minute;
-      const ids=(sqlite.prepare(`SELECT p.id FROM pools p WHERE ${hotWhere}`)
-        .all(env.PRIORITY_TIER1_VOLUME_1H) as {id:string}[]).map((r)=>r.id);
+      const ids=(selected?sqlite.prepare(`SELECT DISTINCT p.id FROM pools p JOIN core_tracking_intervals t ON t.pool_id=p.id WHERE p.chain IN ('solana','base') AND t.started_at<=? AND (t.ended_at IS NULL OR t.ended_at>=?)`).all(at,at-windowMs):sqlite.prepare(`SELECT p.id FROM pools p WHERE ${hotWhere}`).all(env.PRIORITY_TIER1_VOLUME_1H) as {id:string}[]).map(r=>(r as {id:string}).id);
       const intervals=sqlite.prepare(`SELECT started_at startedAt,ended_at endedAt
         FROM core_tracking_intervals WHERE pool_id=? AND started_at<=?
           AND (ended_at IS NULL OR ended_at>=?) ORDER BY started_at`);
@@ -218,21 +272,48 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
         feeCoveragePct:expected?fees/expected*100:null,depthCoveragePct:expected?depth/expected*100:null,
         largestGapMs:pools.length?Math.max(...pools.map((p)=>p.largestGapMs??0)):null,pools};
     },
+    hotPoolDetails(now=Date.now()) {
+      const rows=sqlite.prepare(`SELECT p.id,p.chain,p.data,l.end_time cursorTime,l.head_time headTime,
+        l.updated_at cursorUpdatedAt,h.reason,h.last_error error,
+        (SELECT MAX(timestamp) FROM fee_events e WHERE e.pool_id=p.id) lastSwapTimestamp,
+        (SELECT MAX(block_number) FROM fee_events e WHERE e.pool_id=p.id) lastSwapBlock,
+        (SELECT f.data FROM fee_windows f WHERE f.pool_id=p.id AND f.window_name='1h' ORDER BY window_end DESC LIMIT 1) fee
+        FROM pools p LEFT JOIN live_fee_cursors l ON l.pool_id=p.id LEFT JOIN live_pool_health h ON h.pool_id=p.id
+        WHERE ${hotWhere}`).all(env.PRIORITY_TIER1_VOLUME_1H) as Record<string,unknown>[];
+      return rows.map(row=>{
+        const data=JSON.parse(String(row.data)) as Snapshot,p=data.pool;
+        const fee=row.fee?JSON.parse(String(row.fee)):null;
+        const complete=fee?.windowEnd>=now-300000 && fee?.windowEnd<=now+30000 && fee?.continuityState==='COMPLETE' &&
+          fee?.coveragePct>=99.9 && fee?.methodology==='EVENT_DERIVED';
+        const reliable=(token:typeof p.token0)=>['HIGH','MEDIUM'].includes(token.usdPriceConfidence??'') &&
+          token.usdPriceSourceTimestamp!=null && token.usdPriceSourceTimestamp>=now-env.PRICE_MEDIUM_AGE_SECONDS*1000 &&
+          token.usdPriceSourceTimestamp<=now+30000 && token.usdPrice!==null;
+        const priced=p.timestamp>=now-300000 && reliable(p.token0) && reliable(p.token1) &&
+          ['HIGH','MEDIUM'].includes(data.metrics.priceConfidence??'');
+        const depth=p.depth5PctUsd!==null && p.depthState==='CURRENT' && (p.depthExpiresAt??0)>=now &&
+          ['HIGH','MEDIUM'].includes(p.depthConfidence??'') && (p.depthPriceDriftPct??Infinity)<=env.DEPTH_PRICE_DRIFT_PCT;
+        const lag=row.cursorTime==null?null:Math.max(0,(now-Number(row.cursorTime))/1000);
+        const fresh=lag!==null && lag<=120 && row.headTime!=null && now-Number(row.headTime)<=180000 && Number(row.headTime)<=now+30000;
+        const activity=complete && fee.activityState==='NO_ACTIVITY'?'NO_ACTIVITY':'ACTIVE_OR_MISSING';
+        const reason=staleCursorReason({fresh,lagSeconds:lag,headAgeSeconds:row.headTime==null?null:(now-Number(row.headTime))/1000,
+          updatedAgeSeconds:row.cursorUpdatedAt==null?null:(now-Number(row.cursorUpdatedAt))/1000,
+          error:row.error==null?null:String(row.error),covered:complete,swaps:fee?.swapCount??null});
+        const failures=[p.token0,p.token1].map(token=>({address:token.address,symbol:token.symbol,
+          reliable:reliable(token),provenance:token.priceProvenance??null,failures:(token.priceFailures??[]).map(f=>({MISSING:"NO_SUPPORTED_PRICE_SOURCE",RATE_LIMITED:"SOURCE_RATE_LIMIT",TIMEOUT:"SOURCE_TIMEOUT",STALE:"STALE",DISAGREEMENT:"PRICE_DISAGREEMENT"} as Record<string,string>)[f.reason]??"UNKNOWN")}));
+        return {poolId:p.id,chain:p.chain,priced,depth,feeComplete:complete,activity,fresh,lagSeconds:lag,reason,
+          lastSwapTimestamp:row.lastSwapTimestamp,lastSwapBlock:row.lastSwapBlock,priceTokens:failures};
+      });
+    },
     hotCoverage(now=Date.now()) {
-      return sqlite.prepare(`SELECT p.chain,COUNT(*) pools,
-        SUM(json_extract(p.data,'$.metrics.priceConfidence') IN ('HIGH','MEDIUM')) priced,
-        SUM(json_extract(p.data,'$.pool.depth5PctUsd') IS NOT NULL
-          AND json_extract(p.data,'$.pool.depthExpiresAt')>=?) depth5,
-        SUM(json_extract(p.data,'$.pool.depth5PctUsd') IS NOT NULL
-          AND json_extract(p.data,'$.pool.depthExpiresAt')>=?
-          AND json_extract(p.data,'$.metrics.priceConfidence') IN ('HIGH','MEDIUM')) depth5Priced,
-        SUM(EXISTS(SELECT 1 FROM fee_windows f WHERE f.pool_id=p.id AND f.window_name='1h'
-          AND f.window_end>=? AND json_extract(f.data,'$.methodology')='EVENT_DERIVED'
-          AND json_extract(f.data,'$.continuityState')='COMPLETE'
-          AND json_extract(f.data,'$.coveragePct')>=99.9)) fee1h
-        FROM pools p WHERE ${hotWhere} GROUP BY p.chain ORDER BY p.chain`)
-        .all(now,now,now-5*minute,env.PRIORITY_TIER1_VOLUME_1H) as {chain:string;pools:number;priced:number;
-          depth5:number;depth5Priced:number;fee1h:number}[];
+      const rows=this.hotPoolDetails(now);
+      return [...new Set(rows.map(r=>r.chain))].sort().map(chain=>{
+        const pools=rows.filter(r=>r.chain===chain),active=pools.filter(r=>r.activity!=='NO_ACTIVITY');
+        return {chain,pools:pools.length,priced:pools.filter(r=>r.priced).length,
+          depth5:pools.filter(r=>r.depth).length,depth5Priced:pools.filter(r=>r.depth && r.priced).length,
+          fee1h:pools.filter(r=>r.feeComplete).length,activePools:active.length,
+          activeFee1h:active.filter(r=>r.feeComplete).length,activeFresh:active.filter(r=>r.fresh).length,
+          noActivity:pools.length-active.length};
+      });
     },
     scanLatency(limit=20) {
       const a=(sqlite.prepare("SELECT duration_ms ms FROM scan_metrics ORDER BY run_id DESC LIMIT ?")
@@ -255,7 +336,7 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
         p95Ms:a.length?a[Math.floor((a.length-1)*.95)]:null};
     },
     newOutcomeLag(now=Date.now()) {
-      const row=sqlite.prepare("SELECT valid_from at FROM dataset_versions WHERE version='sprint8-v2'")
+      const row=sqlite.prepare("SELECT valid_from at FROM dataset_versions WHERE version='sprint9-v3'")
         .get() as {at:number}|undefined;
       if(!row) return {n:0,p95Ms:null,legacyCount:0};
       const newLags=(sqlite.prepare(`SELECT o.completed_at-o.due_at lag FROM signal_outcomes o
@@ -271,10 +352,17 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
     },
     outcomeFieldCoverage(now=Date.now(),selected=false) {
       return sqlite.prepare(`SELECT o.horizon,COUNT(*) eligible,
-        SUM(o.status IN ('COMPLETE','PARTIAL')
+        SUM(o.status IN ('COMPLETE','PRICE_RANGE_COMPLETE')
           AND json_extract(o.data,'$.endpointAt') IS NOT NULL
           AND json_extract(o.data,'$.priceReturn') IS NOT NULL
           AND json_extract(o.data,'$.observationCoveragePct')>=80
+          AND json_extract(o.data,'$.priceAtSignal') IS NOT NULL
+          AND json_extract(o.data,'$.priceAtHorizon') IS NOT NULL
+          AND json_extract(o.data,'$.maxPriceMoveUp') IS NOT NULL
+          AND json_extract(o.data,'$.maxPriceMoveDown') IS NOT NULL
+          AND json_extract(o.data,'$.ranges."2.5".timeSpentInRangePct') IS NOT NULL
+          AND json_extract(o.data,'$.ranges."5".timeSpentInRangePct') IS NOT NULL
+          AND json_extract(o.data,'$.ranges."10".timeSpentInRangePct') IS NOT NULL
           AND json_extract(o.data,'$.ranges."2.5".remainedInRange') IS NOT NULL
           AND json_extract(o.data,'$.ranges."5".remainedInRange') IS NOT NULL
           AND json_extract(o.data,'$.ranges."10".remainedInRange') IS NOT NULL) priceRangeComplete
@@ -296,12 +384,14 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
       const prior=sqlite.prepare(`SELECT measured_at at,database_bytes databaseBytes,
         free_bytes freeBytes,objects_json objects FROM storage_measurements
         WHERE measured_at<=? ORDER BY measured_at DESC LIMIT 1`)
-        .get(latest.at-4*3600000) as typeof latest;
+        .get(latest.at-24*3600000) as typeof latest ?? sqlite.prepare(`SELECT measured_at at,database_bytes databaseBytes,free_bytes freeBytes,objects_json objects FROM storage_measurements WHERE measured_at<=? ORDER BY measured_at ASC LIMIT 1`).get(latest.at-4*3600000) as typeof latest;
       if(!prior) return {hours:0,bytesPerDay:null,allocatedBytes:null,databaseBytesDelta:null};
-      const before=new Map((JSON.parse(prior.objects) as {name:string;bytes:number}[])
-        .map((r)=>[r.name,r.bytes]));
-      const allocatedBytes=(JSON.parse(latest.objects) as {name:string;bytes:number}[])
-        .reduce((sum,r)=>sum+Math.max(0,r.bytes-(before.get(r.name)??0)),0);
+      const beforeRows=JSON.parse(prior.objects) as {name:string;bytes:number}[];
+      const afterRows=JSON.parse(latest.objects) as {name:string;bytes:number}[];
+      const before=new Map(beforeRows.map(r=>[r.name,r.bytes]));
+      const occupiedDelta=afterRows.filter(r=>!r.name.startsWith('__')).reduce((sum,r)=>sum+r.bytes-(before.get(r.name)??0),0);
+      const walDelta=(afterRows.find(r=>r.name==='__wal')?.bytes??0)-(before.get('__wal')??0);
+      const allocatedBytes=Math.max(0,occupiedDelta,latest.databaseBytes-prior.databaseBytes+walDelta);
       const hours=(latest.at-prior.at)/3600000;
       return {hours,allocatedBytes,databaseBytesDelta:latest.databaseBytes-prior.databaseBytes,
         bytesPerDay:hours>0?allocatedBytes*24/hours:null};
