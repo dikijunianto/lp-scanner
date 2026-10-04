@@ -38,7 +38,7 @@ export function aggregateDiagnostics(store:Store) {
   const services=providerServices(store.serviceEvidence(generatedAt),generatedAt);
   const epoch=store.validateResearchEpoch({snapshotPct:snapshotCoverage.coveragePct,largestGapMs:snapshotCoverage.largestGapMs,
     breaches:scanWindow.breaches,services,integrityOk:store.integrityStatus()?.state!=='FAIL'},generatedAt);
-  const currentEpochOutcomes=epoch?store.epochOutcomeCoverage(generatedAt,epoch.id):store.epochOutcomeCoverage(generatedAt,'NO_EPOCH');
+  const currentEpochOutcomes=epoch?store.epochOutcomeCoverage(epoch.endedAt??generatedAt,epoch.id):store.epochOutcomeCoverage(generatedAt,'NO_EPOCH');
   const allHistoryOutcomes=store.epochOutcomeCoverage(generatedAt);
   const run=store.latestBurninRun();
   const runData=run?JSON.parse(run.data):null;

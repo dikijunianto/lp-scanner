@@ -22,7 +22,7 @@ try {
     if(!cleanEpochFreezeAllowed({version:version.version,summaryStatus:summary?.readiness?.status??'NOT_READY',
       summaryAgeMs:Date.now()-(summary?.generatedAt??0),maxSummaryAgeMs:env.DIAGNOSTICS_MAX_AGE_SECONDS*1000,
       epoch:createEpochStore(gateDb).researchEpoch(),runId:run?.id??null,summaryRunId:summary?.burninRunId??null,
-      runStatus:run?.status??'UNKNOWN',epochId:run?.research_epoch_id??null,actualDurationMs:run?.actual_duration_ms??null,
+      runStatus:run?.status??'UNKNOWN',runReadiness:data?.readiness?.status??'NOT_READY',epochId:run?.research_epoch_id??null,actualDurationMs:run?.actual_duration_ms??null,
       clockValid:data?.clock?.valid===true}))throw new Error('Freeze requires fresh READY v4, complete clean epoch and matching PASS24h run');
   }
   if(version?.version==='sprint9-v3') {

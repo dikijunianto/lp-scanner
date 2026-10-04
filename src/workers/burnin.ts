@@ -69,7 +69,7 @@ while(!interrupted && Date.now()-researchEpoch.startedAt<3600000){const at=Date.
 writeFileSync(path,JSON.stringify({status:'WARMUP',burninRunId,researchEpochId:researchEpoch.id,epochStartedAt:researchEpoch.startedAt,
   expectedObservationStart:researchEpoch.startedAt+3600000,expectedObservationEnd:researchEpoch.startedAt+3600000+durationMs,keepAwakePid:caffeinate.pid,leadSamples},null,2));
 await new Promise<void>(r=>setTimeout(r,Math.min(60000,Math.max(1,3600000-(Date.now()-researchEpoch.startedAt)))));}
-if(interrupted){epochStore(store=>store.finishResearchEpoch(researchEpoch.id,'INVALID','INTERRUPTED_DURING_LEAD'));epochStore(store=>store.updateBurninRun(burninRunId,null,null,'FAIL',{reason:'INTERRUPTED_DURING_LEAD',leadSamples}));throw new Error('Burn-in interrupted during maturity lead');}
+if(interrupted){epochStore(store=>store.finishResearchEpoch(researchEpoch.id,'INVALID','INTERRUPTED_DURING_LEAD'));const reason=epochStore(store=>store.researchEpoch(researchEpoch.id))?.invalidationReason??'INTERRUPTED_DURING_LEAD';const evidence={status:'FAIL',burninRunId,researchEpochId:researchEpoch.id,reason,leadSamples,endedAt:Date.now()};epochStore(store=>store.updateBurninRun(burninRunId,null,null,'FAIL',evidence));writeFileSync(path,JSON.stringify(evidence,null,2));throw new Error('Burn-in interrupted during maturity lead');}
 const leadEnd=await get<Summary>('/diagnostics/reliability');
 if(keepAwakeFailed || epochStore(store=>store.researchEpoch(researchEpoch.id))?.status!=='ACTIVE' || !servicesAcceptable(leadEnd.providerServices) || methodologyFingerprint()!==methodologyHash){
  epochStore(store=>store.finishResearchEpoch(researchEpoch.id,'INVALID','LEAD_VALIDATION_FAILURE'));

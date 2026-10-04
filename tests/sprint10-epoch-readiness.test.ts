@@ -86,9 +86,9 @@ describe('hourly V4 readiness and freeze safety',()=>{
   expect(assessReadinessV4({...good,history:cursor}).failed).toContain('BASE_CURSOR_HOURLY');
  });
  it('requires matching complete epoch and authoritative PASS run for freeze',()=>{
-  const input={version:'sprint10-v4',summaryStatus:'READY',summaryAgeMs:10,maxSummaryAgeMs:1000,epoch,runId:'run',summaryRunId:'run',runStatus:'PASS',epochId:epoch.id,actualDurationMs:86400000,clockValid:true};
+  const input={version:'sprint10-v4',summaryStatus:'READY',summaryAgeMs:10,maxSummaryAgeMs:1000,epoch,runId:'run',summaryRunId:'run',runStatus:'PASS',runReadiness:'READY',epochId:epoch.id,actualDurationMs:86400000,clockValid:true};
   expect(cleanEpochFreezeAllowed(input)).toBe(true);
-  for(const patch of [{summaryStatus:'NOT_READY'},{summaryRunId:'other'},{clockValid:false},{epoch:{...epoch,status:'ACTIVE' as const}},{actualDurationMs:86399999}])expect(cleanEpochFreezeAllowed({...input,...patch})).toBe(false);
+  for(const patch of [{runReadiness:'NOT_READY'},{summaryStatus:'NOT_READY'},{summaryRunId:'other'},{clockValid:false},{epoch:{...epoch,status:'ACTIVE' as const}},{actualDurationMs:86399999}])expect(cleanEpochFreezeAllowed({...input,...patch})).toBe(false);
  });
 });
 describe('clean reliable-price density',()=>{
