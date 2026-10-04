@@ -15,3 +15,7 @@ Known limits before measurement: conservative graph screens can leave thin token
 ## Preserved lead attempt
 
 Run3f5c8017-2a84-408a-8ea8-31dcefc86d2f / epoch7751396e-5bd0-4d40-ab6d-35d92279db45 began its maturity lead at4Oct21:17:09WIB. It was explicitly invalidated with FREEZE_COHORT_ENDPOINT_GUARD before the formal24h window: freeze must require the matching run's own READY verdict, and completed-epoch outcome eligibility must stop at endedAt. Its report/lead samples and database history remain preserved. This is a failed lead, not a completed or reset24h run.
+
+## Preserved startup attempt
+
+The14:22:43UTC launcher did not start an epoch or observation because its service barrier overlooked fresh pinned reads from completed Base depth reconstructions. The log remains retained. Startup polling also approached the120requests/minute local API cap; it is now5seconds. Verified reconstruction evidence supplements pool-state evidence without suppressing per-pool failure counts.

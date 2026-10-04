@@ -111,6 +111,12 @@ export function createEpochStore(sqlite:Database.Database) {return {
     const states=sqlite.prepare("SELECT chain,MAX(json_extract(data,'$.pool.pairState.sourceTimestamp')) at FROM pools GROUP BY chain").all() as {chain:string;at:number|null}[];
     for(const p of states)for(const service of ['CURRENT_STATE','DEPTH_STATE'])evidence.push({chain:p.chain,service,
       source:'VALIDATED_PINNED_POOL_STATE',lastSuccessAt:p.at,healthy:true});
+    // A completed reconstruction also proves a fresh pinned current-state read.
+    const reconstructed=sqlite.prepare(`SELECT p.chain,MAX(d.updated_at) at FROM depth_reconstruction_cache d
+      JOIN pools p ON p.id=d.pool_id WHERE json_extract(d.data,'$.confidence') IN ('HIGH','MEDIUM') GROUP BY p.chain`)
+      .all() as {chain:string;at:number}[];
+    for(const p of reconstructed)for(const service of ['CURRENT_STATE','DEPTH_STATE'])evidence.push({chain:p.chain,service,
+      source:'VALIDATED_DEPTH_RECONSTRUCTION',lastSuccessAt:p.at,healthy:true});
     const logs=sqlite.prepare("SELECT chain,source_id sourceId,MAX(updated_at) at FROM live_fee_cursors GROUP BY chain,source_id").all() as {chain:string;sourceId:string;at:number}[];
     for(const p of logs)evidence.push({chain:p.chain,service:'LIVE_EVENTS',source:p.sourceId,lastSuccessAt:p.at,healthy:now-p.at<=180000});
     return evidence;

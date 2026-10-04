@@ -50,10 +50,10 @@ process.on('SIGINT',stop);process.on('SIGTERM',stop);
 try {
 try{await get('/health');}catch{const log=openSync(path.replace(/\.json$/,'.log'),'a');app=spawn('pnpm',['start'],{cwd:process.cwd(),detached:true,stdio:['ignore',log,log]});}
 let ready=false;
-for(let i=0;i<180;i++){try{const h=await get<{status:string;readOnly:boolean}>('/health');const d=await get<Summary>('/diagnostics/reliability');
+for(let i=0;i<180 && !interrupted;i++){try{const h=await get<{status:string;readOnly:boolean}>('/health');const d=await get<Summary>('/diagnostics/reliability');
   if(h.status==='ok' && h.readOnly===true && !d.summaryStale && servicesAcceptable(d.providerServices) && d.epochLaunchHealth.snapshotHealthy && d.epochLaunchHealth.deadlineHealthy && d.dbIntegrity?.state==='OK'){ready=true;break;}}catch{/* Startup warmup is outside the observation window. */}
-  await new Promise<void>(r=>setTimeout(r,1000));}
-if(!ready){if(app?.pid)try{process.kill(-app.pid,'SIGINT');}catch{}caffeinate?.kill();throw new Error('Production app did not produce a fresh healthy summary');}
+  await new Promise<void>(r=>setTimeout(r,5000));}
+if(!ready){writeFileSync(path,JSON.stringify({status:'FAIL',burninRunId,reason:interrupted?'STARTUP_INTERRUPTED':'STARTUP_REQUIRED_SERVICES_UNAVAILABLE',requestedAt,observationStarted:false},null,2));if(app?.pid)try{process.kill(-app.pid,'SIGINT');}catch{}caffeinate?.kill();throw new Error('Production app did not produce a fresh healthy summary');}
 const initial=await get<Summary>('/diagnostics/reliability');
 if(!servicesAcceptable(initial.providerServices) || !initial.epochLaunchHealth.snapshotHealthy || !initial.epochLaunchHealth.deadlineHealthy)
   throw new Error('Required services, core writer and foreground evidence must be healthy before epoch start');
