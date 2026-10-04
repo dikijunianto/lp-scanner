@@ -7,3 +7,7 @@ Cross-asset pricing uses another validated pool, an approved address-bound SOL/W
 Meteora active-bin balances provide a conservative actual deposited lower bound when the reference side has independent pricing. V3 virtual reserves are not actual deposited collateral and never qualify as derivation liquidity. Approved references are address lists, not symbols. Other assets require an explicit approved mapping; USDT symbols alone do not qualify.
 
 HOT diagnostics report token failures separately: unsupported sampled sources, timeout, rate limit, stale, disagreement orUNKNOWN. Mapping/too-new classifications require evidence and are not inferred from missing quotes. Provider details remain attached to token records. Existing non-timestamped pair quotes remain unsupported. New source integrations requiring credentials have not been invented; the80% target remains a measured gate, not a confidence downgrade.
+
+## Measured 24h result
+
+Reliable selected HOT pair pricing ended at 22/104 (21.154%): Solana 17/96, Base 5/8. All 82 unavailable pools remain included; the 80% target passed at 0/24 hourly checkpoints. Current depth among reliably priced pools was 13/22 (59.091%). Timestamp/source expansion has not met readiness. [Full measured evidence](sprint9-validation.md).

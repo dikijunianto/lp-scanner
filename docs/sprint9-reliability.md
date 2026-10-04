@@ -14,6 +14,6 @@ Diagnostics aggregates run in their own worker. API reads one compact materializ
 
 Validation:136 deterministic tests passed; lint/typecheck/production build passed. Live SQLite full integrity `ok`, ANALYZE and TRUNCATE checkpoint passed with services stopped. Pre-migration backup retained at data/before-sprint9.sqlite. Sprint8 frozen archive checksum and restored integrity verified; compaction dry-run found0 eligible event/snapshot rows,0 affected signals/outcomes. No compaction executed.
 
-## Remaining proof
+## Final measured validation
 
-Actual uninterrupted24h run and27-field final report are required. Targets are not claimed from startup measurements. See24h-burnin.md and readiness-v3.md. BSC remains outside selected-chain readiness.
+Raw burn-in FAIL because the clock comparison samples mismatched end points. Observed operational deadline/health/cadence checks passed; selected-chain readiness remains NOT_READY. All source failures and denominators are retained. Post-run integrity/ANALYZE/checkpoint passed, production restarted read-only. See [the complete measured report](sprint9-validation.md) for all 27 fields and evidence limitations.

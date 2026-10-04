@@ -7,3 +7,7 @@ Validated pinned V3 token addresses, decimals and fee tier can be used independe
 Every HOT pool remains in all-HOT reporting. Active denominator removes only fresh complete EVENT_DERIVED windows that prove NO_ACTIVITY. Missing infrastructure stays in the denominator. Cursor reasons distinguish no recent activity, RPC failure, timeout, rate limit, stuck cursor, starvation, stale head andunknown. Stored heads must be fresh as well as cursor timestamp; missing heads cannot become healthy evidence.
 
 ±5% V3 depth caches pinned state, tick bitmap words and liquidityNet within bounded coverage. Exact-block/state-key reuse is safe. Cross-block reuse is deliberately unavailable without Mint/Burn invalidation evidence; unchanged current tick alone cannot prove unchanged liquidityNet. Meteora fetches only required±5% arrays and retries once when active-bin state moves. Depth requires state/price age, publication freshness and price drift constraints. Stale depth never counts current.10% data not fetched in the5% path remains null.
+
+## Measured 24h result
+
+Final Base all HOT 8, active-or-missing 8, proven NO_ACTIVITY 0: cursors 7/8 fresh (87.5%), complete current USD 1h fees 4/8 (50%). Median lag 35.311s; p95/max 189,031.311s with all 8 known. Persistent xdp RPC_FAILURE remains included. Cursor and fee hourly targets passed at 0/24 checkpoints; selected provider health passed only 7/24. Post-restart UI shows request-budget exhaustion/rate-limit limitations. [All pool addresses and hourly evidence](sprint9-validation.md).
