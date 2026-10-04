@@ -4,7 +4,7 @@ Status: IMPLEMENTED; final measured24h validation PENDING. No READY claim or dat
 
 Branch codex/sprint-10-clean-epoch continues Sprint9, preserving prior reports/history. Pre-migration consistent backup: data/before-sprint10.sqlite (9,301,786,624bytes). Additive epochs, interval/source coverage and fee-invariant migrations preserve old rows. No signing, transactions, Strategy Lab, VACUUM, automatic archival or index deletion.
 
-Final prelaunch checks:194 deterministic tests passed; lint, typecheck and production build passed. Full live SQLite integrity returned ok in96.657s; ANALYZE completed and stopped-service TRUNCATE checkpoint returned busy0/log0/checkpointed0. Repeat full integrity with stopped services after observation. Actual process/run/epoch IDs and timing are appended once launched.
+Final prelaunch checks:196 deterministic tests passed; lint, typecheck and production build passed. Full live SQLite integrity returned ok in96.657s; ANALYZE completed and stopped-service TRUNCATE checkpoint returned busy0/log0/checkpointed0. Repeat full integrity with stopped services after observation. Actual process/run/epoch IDs and timing are appended once launched.
 
 Production configuration for observation: Economic refresh30s, Meteora state limit80, HOT reservation200; other limits remain existing configuration. A one-hour preserved maturity lead precedes the actual uninterrupted24h interval. Keep-awake must stay alive. No runtime/methodology changes during either phase. Any failed evidence remains retained.
 
@@ -18,4 +18,4 @@ Run3f5c8017-2a84-408a-8ea8-31dcefc86d2f / epoch7751396e-5bd0-4d40-ab6d-35d92279d
 
 ## Preserved startup attempt
 
-The14:22:43UTC launcher did not start an epoch or observation because its service barrier overlooked fresh pinned reads from completed Base depth reconstructions. The log remains retained. Startup polling also approached the120requests/minute local API cap; it is now5seconds. Verified reconstruction evidence supplements pool-state evidence without suppressing per-pool failure counts.
+The14:22:43UTC launcher eventually started lead run9c3a08a9-06df-4d6d-9071-62db49af0513 / epochac49af46-3a39-4e78-a0ee-1033d3a022ef at21:25:15WIB. It was interrupted before observation to correct service evidence and startup polling; all five lead samples, original run evidence and invalid epoch remain retained. Neither previous lead attempt started the formal24h observation. Startup polling also approached the120requests/minute local API cap; it is now5seconds. Verified reconstruction evidence supplements pool-state evidence without suppressing per-pool failure counts.

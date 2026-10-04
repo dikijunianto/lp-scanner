@@ -1,3 +1,4 @@
+import {sql} from 'drizzle-orm';
 import {describe,it,expect} from 'vitest';
 import {createStore} from '../src/db/store';
 import {activeCursorState,coveredIntervals,epochInvalidation,epochMethodologies,lagDistribution,pairedClockInterval,type ResearchEpoch} from '../src/core/epoch';
@@ -14,6 +15,26 @@ const services=providerServices(evidence,now);
 const goodHour=(hour:number):HourlySloV4=>({hour,healthy:true,freshSummary:true,cursorFreshRatio:1,cursorMedianLagSeconds:10,feeRatio:1,priceRatio:1,depthRatio:1,snapshotPct:100,largestGapMs:60000,providerHealthy:true,newOutcomeP95Ms:1000});
 const good={epoch,outcomes:[{horizon:'4h',eligible:100,priceRangeComplete:100,partial:0,missing:0},{horizon:'24h',eligible:20,priceRangeComplete:20,partial:0,missing:0}],services,history:Array.from({length:24},(_,i)=>goodHour(i+1)),hours:24,clockValid:true,scans:{p95Ms:5000,p99Ms:6000,maxMs:8000,breaches:0},storage:{hours:24,bytesPerDay:.1*2**30,runwayDays:180},bscLiveLogs:false};
 describe('clean epoch lifecycle and retained history',()=>{
+ it('uses fresh writer and scan evidence rather than an old finished run',()=>{
+  const store=createStore(':memory:');try{
+   expect(store.epochLaunchHealth(now)).toEqual({snapshotHealthy:false,deadlineHealthy:false});
+   store.db.run(sql`INSERT INTO core_writer_runs VALUES (${now},${now-10},${now},10,1,0,'OK')`);
+   store.db.run(sql`INSERT INTO scanner_runs VALUES (1,${now-1000},${now},'ok','[]')`);
+   store.db.run(sql`INSERT INTO scan_traces VALUES (1,${now-1000},${now},1000,1000,20000,0,NULL)`);
+   expect(store.epochLaunchHealth(now)).toEqual({snapshotHealthy:true,deadlineHealthy:true});
+   expect(store.epochLaunchHealth(now+120001)).toEqual({snapshotHealthy:false,deadlineHealthy:false});
+  }finally{store.close();}
+ });
+ it('accepts verified fresh reconstruction state when price-pool metadata is absent',()=>{
+  const store=createStore(':memory:');try{
+   const p=emptyPool({chain:'base',protocol:'uniswap-v3',dex:'fixture',poolAddress:'0x'+'1'.repeat(40),token0:emptyToken('0x'+'2'.repeat(40),'A'),token1:emptyToken('0x'+'3'.repeat(40),'B'),source:'fixture'},now);
+   store.save([snapshot(p,[])]);
+   store.db.run(sql`INSERT INTO depth_reconstruction_cache VALUES (${p.id},'pinned','123',${now},${JSON.stringify({confidence:'MEDIUM'})})`);
+   const result=providerServices(store.serviceEvidence(now),now);
+   expect(result.find(s=>s.chain==='base'&&s.service==='CURRENT_STATE')).toMatchObject({state:'HEALTHY',sources:['VALIDATED_DEPTH_RECONSTRUCTION']});
+   expect(providerServices(store.serviceEvidence(now+180001),now+180001).find(s=>s.chain==='base'&&s.service==='DEPTH_STATE')?.state).toBe('UNAVAILABLE');
+  }finally{store.close();}
+ });
  it('guards start, permits one ACTIVE epoch, and records immutable invalidation',()=>{
   const store=createStore(':memory:');try{
    expect(()=>store.startResearchEpoch({snapshotHealthy:false,deadlineHealthy:true,servicesAcceptable:true},'bad',now)).toThrow();
