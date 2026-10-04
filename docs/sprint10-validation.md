@@ -19,3 +19,7 @@ Run3f5c8017-2a84-408a-8ea8-31dcefc86d2f / epoch7751396e-5bd0-4d40-ab6d-35d92279d
 ## Preserved startup attempt
 
 The14:22:43UTC launcher eventually started lead run9c3a08a9-06df-4d6d-9071-62db49af0513 / epochac49af46-3a39-4e78-a0ee-1033d3a022ef at21:25:15WIB. It was interrupted before observation to correct service evidence and startup polling; all five lead samples, original run evidence and invalid epoch remain retained. Neither previous lead attempt started the formal24h observation. Startup polling also approached the120requests/minute local API cap; it is now5seconds. Verified reconstruction evidence supplements pool-state evidence without suppressing per-pool failure counts.
+
+## Active validation
+
+Report: reports/burnin-2026-10-04T14-33-15-707Z.json. Burnin run7ca19b94-adef-4b51-8028-10a3fc2665a8; epochbb25023c-0761-433f-9a1d-eab576f9541a. Launcher62054, keep-awake62063. Lead began4Oct2026 21:34:40WIB; expected observation4Oct22:34:40–5Oct22:34:40WIB. Actual paired start/end in the persisted run remain authoritative. Methodology frozen at d263d38. Hourly follow-up is scheduled to finish the actual33-field report, verify integrity and freeze only if READY. Startup/UI checks show read-only health and correct NOT_READY/missing-data displays; required services were acceptable at epoch creation. No final coverage or storage target is claimed.
