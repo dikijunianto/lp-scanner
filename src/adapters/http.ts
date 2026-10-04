@@ -23,7 +23,7 @@ export class HttpClient {
       const wait = Math.max(0, this.nextAt - Date.now());
       this.nextAt = Date.now() + wait + this.spacingMs;
       if (wait) await sleep(wait,undefined,{signal:options.signal});
-      const started=Date.now();
+      const started=Date.now(),monotonicStarted=performance.now();
       let reason="OK";
       try {
         options.signal?.throwIfAborted();
@@ -69,9 +69,10 @@ export class HttpClient {
         if (attempt === this.retries) throw new Error("Upstream request failed or timed out");
         await sleep(500 * 2 ** attempt,undefined,{signal:options.signal});
       } finally {
-        traceSlow(new URL(url).hostname,Date.now()-started,reason);
+        const wall=Date.now()-started,mono=performance.now()-monotonicStarted;
+        if(Math.abs(wall-mono)<=2000 && mono<=this.timeoutMs+2000)traceSlow(new URL(url).hostname,mono,reason);
         traceSpan("network",options.body?"POST":"GET",new URL(url).hostname,started,
-          this.timeoutMs,reason==="OK");
+          this.timeoutMs,reason==="OK",reason==="OK"?null:reason,options.signal?.aborted??false,monotonicStarted);
       }
     }
     throw new Error("Upstream retries exhausted");

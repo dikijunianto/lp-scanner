@@ -67,7 +67,7 @@ describe("Sprint 6 live recovery",()=>{
       expect(done).toBe(4);
       const outcomes=store.signalDetail(id)!.outcomes;
       expect(outcomes.map((o)=>[o.horizon,o.status])).toEqual([
-        ["30m","COMPLETE"],["1h","COMPLETE"],["4h","COMPLETE"],["24h","COMPLETE"]]);
+        ["30m","PRICE_RANGE_COMPLETE"],["1h","PRICE_RANGE_COMPLETE"],["4h","PRICE_RANGE_COMPLETE"],["24h","PRICE_RANGE_COMPLETE"]]);
       expect(outcomes.every((o)=>o.data?.outcomeCompletenessPct!==undefined)).toBe(true);
       expect(store.outcomePipeline().every((r)=>Number(r.overdue)===0)).toBe(true);
     } finally {store.close();}

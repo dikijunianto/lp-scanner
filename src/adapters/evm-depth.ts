@@ -5,7 +5,8 @@ import { priorityTier } from "../core/research";
 import { priorityPolicy } from "../config/env";
 import type { Pool } from "../core/model";
 import type { Store, DepthRow } from "../db/store";
-import { readContracts } from "./evm-liquidity";
+import { enrichEvmLiquidity, readContracts } from "./evm-liquidity";
+import { fresh } from "../core/liquidity";
 import { ReadOnlyRpc, blockSchema, words } from "./liquidity-rpc";
 
 const abi = new Interface([
@@ -25,7 +26,7 @@ export async function readDepthContracts(rpc:ReadOnlyRpc,calls:{to:string;data:s
 }
 export function applyDepth(pool: Pool, row: DepthRow, ttlMs = env.DEPTH_REFRESH_SECONDS * 1000) {
   const drift = depthDriftPct(row.priceAtCalculation,pool.price);
-  const stale = drift === null || drift > env.DEPTH_PRICE_DRIFT_PCT;
+  const stale = !fresh(row.updatedAt,Date.now(),ttlMs) || drift === null || drift > env.DEPTH_PRICE_DRIFT_PCT;
   pool.depth1PctUsd = stale ? null : row.depth1PctUsd;
   pool.depth2_5PctUsd = stale ? null : row.depth2_5PctUsd;
   pool.depth5PctUsd = stale ? null : row.depth5PctUsd;
@@ -52,7 +53,8 @@ export function depthTargets(pools: Pool[], store: Store, cacheOnly: boolean,
   if (cacheOnly) return rows;
   return rows.filter(({pool,old})=>{
     if(!old) return true;
-    const d=pool.activeLiquidityDetails!;
+    const d=pool.activeLiquidityDetails;
+    if(!d || !fresh(d.blockTime,Date.now(),env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS*1000)) return true;
     const key=d.method==="V3_VIRTUAL_RESERVES_V1"
       ? v3DepthKey(d.tick!,d.tickSpacing!,d.liquidityRaw!,d.price0Usd,d.price1Usd)
       : dlmmDepthKey(d.activeBinId!,d.binStep!,d.price0Usd,d.price1Usd);
@@ -69,7 +71,8 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
   const eligible = pools
     .filter(
       (p) =>
-        p.activeLiquidityDetails?.method === "V3_VIRTUAL_RESERVES_V1" &&
+        (p.activeLiquidityDetails?.method === "V3_VIRTUAL_RESERVES_V1" ||
+          (!p.activeLiquidityDetails && ["uniswap-v3","pancakeswap-v3"].includes(p.protocol))) &&
         ["HIGH", "MEDIUM"].includes(p.token0.usdPriceConfidence ?? "UNAVAILABLE") &&
         ["HIGH", "MEDIUM"].includes(p.token1.usdPriceConfidence ?? "UNAVAILABLE"),
     );
@@ -79,6 +82,15 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
     cached = 0;
   const reasons = new Map<string, number>();
   for (const {pool,old} of targets) {
+    if (!cacheOnly && (!pool.activeLiquidityDetails ||
+      !fresh(pool.activeLiquidityDetails.blockTime,Date.now(),env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS*1000)) &&
+      (pool.chain==="base" || pool.chain==="bsc"))
+      await enrichEvmLiquidity([pool],pool.chain,rpc);
+    if (pool.activeLiquidityDetails?.method!=="V3_VIRTUAL_RESERVES_V1" ||
+      !fresh(pool.activeLiquidityDetails.blockTime,Date.now(),env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS*1000)) {
+      if(!cacheOnly) store.recordDepthFailure(pool.id,"Stale or missing depth pool state");
+      continue;
+    }
     const details = pool.activeLiquidityDetails!;
     const stateKey = v3DepthKey(details.tick!,details.tickSpacing!,details.liquidityRaw!,
       details.price0Usd,details.price1Usd);
@@ -115,8 +127,10 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
       }
       const positions = Array.from({ length: lastWord - firstWord + 1 }, (_, i) => firstWord + i);
       const cachedReconstruction=store.depthReconstruction(pool.id,stateKey,details.block) as
-        {nets:TickNet[];method?:"TICK_BITMAP"|"ONCHAIN_DIRECT";blockHash?:string}|null;
-      let nets=cachedReconstruction?.blockHash?.toLowerCase()===anchor.hash.toLowerCase()
+        {nets:TickNet[];method?:"TICK_BITMAP"|"ONCHAIN_DIRECT";blockHash?:string;lowerTick?:number;upperTick?:number}|null;
+      let nets=cachedReconstruction?.blockHash?.toLowerCase()===anchor.hash.toLowerCase() &&
+        cachedReconstruction.lowerTick!==undefined && cachedReconstruction.lowerTick<=lowerTick &&
+        cachedReconstruction.upperTick!==undefined && cachedReconstruction.upperTick>=upperTick
         ?cachedReconstruction.nets:undefined;
       let method=nets?cachedReconstruction?.method??"TICK_BITMAP":"TICK_BITMAP";
       if(!nets) {
@@ -150,10 +164,12 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
           return { tick: t, liquidityNet: BigInt.asIntN(128, state[1]).toString() };
         });
         store.cacheDepthReconstruction(pool.id,stateKey,details.block,
-          {positions,rawBitmap,nets,method,blockHash:anchor.hash});
+          {positions,rawBitmap,nets,method,blockHash:anchor.hash,lowerTick,upperTick});
       }
       const finalBlock=blockSchema.parse(await rpc.call("eth_getBlockByNumber",[details.block,false]));
       if(finalBlock.hash.toLowerCase()!==anchor.hash.toLowerCase()) throw new Error("Depth block changed");
+      if(!fresh(details.blockTime,Date.now(),env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS*1000))
+        throw new Error("Stale depth pool state");
       const values = tickDepth(
         nets,
         details.liquidityRaw!,
@@ -162,7 +178,7 @@ export async function enrichEvmDepth(pools: Pool[], rpc: ReadOnlyRpc, store: Sto
         details.decimals1,
         details.price0Usd,
         details.price1Usd,
-        { lowerTick: firstWord * 256 * spacing, upperTick: ((lastWord + 1) * 256 - 1) * spacing },
+        { lowerTick, upperTick },
         details.token0Address.toLowerCase() !== pool.token0Address.toLowerCase(),
       );
       if (values.depth5PctUsd === null) {

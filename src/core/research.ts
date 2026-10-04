@@ -108,6 +108,8 @@ export interface RangeOutcome {
 }
 export interface Outcome {
   endpointAt: number | null;
+  priceAtSignal?: number | null;
+  priceAtHorizon?: number | null;
   observationCoveragePct: number;
   priceReturn: number | null;
   feesGenerated: number | null;
@@ -157,7 +159,7 @@ export function evaluateOutcome(
       (s) =>
         s.pool.timestamp > start &&
         s.pool.timestamp <= due + policy.maxObservationGapMs &&
-        s.pool.id === signal.pool.id,
+        s.pool.id === signal.pool.id && valid(s.pool.price) && s.pool.price > 0,
     )
     .sort((a, b) => a.pool.timestamp - b.pool.timestamp);
   const endpoint = observations.find((s) => s.pool.timestamp >= due) ?? null;
@@ -228,8 +230,15 @@ export function evaluateOutcome(
       timeSpentInRangePct: enough ? Math.min(100, (insideMs / horizons[horizon]) * 100) : null,
     };
   }
+  const currentDepth=(s:Snapshot)=>s.pool.depthState==="CURRENT" &&
+    ["HIGH","MEDIUM"].includes(s.pool.depthConfidence??"UNAVAILABLE") &&
+    valid(s.pool.depthExpiresAt) && s.pool.depthExpiresAt>=s.pool.timestamp &&
+    valid(s.pool.depthUpdatedAt) && s.pool.depthUpdatedAt<=s.pool.timestamp+30000
+      ?s.pool.depth5PctUsd:null;
   const result:Outcome = {
     endpointAt: endpoint?.pool.timestamp ?? null,
+    priceAtSignal: valid(startPrice) && startPrice>0 ? startPrice : null,
+    priceAtHorizon: endpoint?.pool.price ?? null,
     observationCoveragePct: coverage,
     priceReturn: endpoint ? change(startPrice, endpoint.pool.price) : null,
     feesGenerated: generated.fees,
@@ -239,7 +248,7 @@ export function evaluateOutcome(
     activeLiquidityChange: endpoint
       ? change(signal.pool.activeLiquidityUsd, endpoint.pool.activeLiquidityUsd)
       : null,
-    depth5PctChange: endpoint ? change(signal.pool.depth5PctUsd, endpoint.pool.depth5PctUsd) : null,
+    depth5PctChange: endpoint ? change(currentDepth(signal),currentDepth(endpoint)) : null,
     maxPriceMoveUp: priceMoves.length ? Math.max(...priceMoves) : null,
     maxPriceMoveDown: priceMoves.length ? Math.min(...priceMoves) : null,
     maxObservedVolatility: vols.length ? Math.max(...vols) : null,
@@ -259,9 +268,11 @@ export function evaluateOutcome(
   const group=(values:(unknown|null|undefined)[],sufficient:boolean)=>sufficient?"COMPLETE" as const:
     values.some((v)=>v!==null && v!==undefined)?"PARTIAL" as const:"UNAVAILABLE" as const;
   result.fieldCompleteness={
-    price:group([result.endpointAt,result.priceReturn],enough && result.priceReturn!==null),
-    range:group(Object.values(result.ranges).map((r)=>r.remainedInRange),
-      enough && Object.values(result.ranges).every((r)=>r.remainedInRange!==null)),
+    price:group([result.priceAtSignal,result.priceAtHorizon,result.priceReturn,
+      result.maxPriceMoveUp,result.maxPriceMoveDown],enough &&
+      [result.priceAtSignal,result.priceAtHorizon,result.priceReturn,result.maxPriceMoveUp,result.maxPriceMoveDown].every(valid)),
+    range:group(Object.values(result.ranges).flatMap((r)=>[r.remainedInRange,r.timeSpentInRangePct]),
+      enough && Object.values(result.ranges).every((r)=>r.remainedInRange!==null && valid(r.timeSpentInRangePct))),
     fee:group([result.feesGenerated,result.volumeGenerated],
       result.feesGenerated!==null && result.volumeGenerated!==null),
     depth:group([result.depth5PctChange],result.depth5PctChange!==null),

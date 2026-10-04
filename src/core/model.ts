@@ -1,4 +1,6 @@
 import { liquidityDefaults, type LiquidityDetails, type LiquiditySource } from "./liquidity";
+import type {PriceProvenance,PairPriceState} from "./pricing";
+import type {PriceFailure} from "../adapters/pricing";
 export const windows = ["5m", "30m", "1h", "4h", "24h"] as const;
 export type Window = (typeof windows)[number];
 export const windowMs: Record<Window, number> = {
@@ -11,6 +13,7 @@ export const windowMs: Record<Window, number> = {
 export type Nullable = number | null;
 export type Confidence = "HIGH" | "MEDIUM" | "LOW" | "UNAVAILABLE";
 export interface PriceRecord {
+  provenance?:PriceProvenance;
   assetAddress: string;
   chain: string;
   symbol: string;
@@ -44,6 +47,8 @@ export interface FeeWindow {
   eventSource?:string|null;
 }
 export interface Token {
+  priceFailures?:PriceFailure[];
+  priceProvenance?:PriceProvenance|null;
   address: string;
   symbol: string;
   decimals: Nullable;
@@ -62,6 +67,7 @@ export interface Token {
   verified: boolean | null;
 }
 export type Pool = {
+  pairState?:PairPriceState;
   id: string;
   chain: string;
   protocol: string;

@@ -26,6 +26,7 @@ export class Scanner {
   constructor(
     private store: Store,
     public adapters = makeAdapters(),
+    private runId?:number,
   ) {}
   get running() {
     return this.active !== null;
@@ -45,15 +46,17 @@ export class Scanner {
     const startedAt = Date.now();
     const sync=<T>(phase:string,operation:string,work:()=>T):T=>{
       const started=Date.now();let success=false;
+      process.send?.({type:"spanStart",span:{phase,operation,provider:null,startedAt:started,timeoutMs:env.SCAN_DEADLINE_MS}});
       try {signal.throwIfAborted();const value=work();success=true;return value;}
       finally {traceSpan(phase,operation,null,started,null,success);}
     };
     const asyncPhase=async <T>(phase:string,operation:string,work:()=>Promise<T>):Promise<T>=>{
       const started=Date.now();let success=false;
+      process.send?.({type:"spanStart",span:{phase,operation,provider:null,startedAt:started,timeoutMs:env.SCAN_DEADLINE_MS}});
       try {signal.throwIfAborted();const value=await work();success=true;return value;}
       finally {traceSpan(phase,operation,null,started,env.SCAN_DEADLINE_MS,success);}
     };
-    const id = this.store.db
+    const id = this.runId ?? this.store.db
       .insert(runs)
       .values({ startedAt, status: "running", data: [] })
       .returning({ id: runs.id })
@@ -68,7 +71,9 @@ export class Scanner {
           sync("cache","pool state reads",()=>{for(const pool of pools) {
             signal.throwIfAborted();
             const cached=this.store.get(pool.id)?.pool;
-            if(!cached || cached.activeLiquidityUsd===null) continue;
+            if(!cached)continue;
+            pool.pairState=cached.pairState;
+            if(cached.activeLiquidityUsd===null)continue;
             for(const key of ["activeLiquidityUsd","activeLiquiditySource","activeLiquidityConfidence",
               "activeLiquidityUpdatedAt","activeLiquidityExpiresAt","activeLiquidityReason",
               "activeLiquidityDetails"] as const) (pool as unknown as Record<string,unknown>)[key]=cached[key];
@@ -167,7 +172,8 @@ export class Scanner {
     const durationMs = Date.now() - startedAt;
     this.store.saveScanMetrics(id, durationMs, traffic.apiRequests, traffic.rpcRequests, traffic.cacheHits);
     this.store.recordScanSlowCalls(id,traffic.slowCalls??[]);
-    this.store.recordScanSpans(id,traffic.spans??[]);
+    if(this.store.keepScanTrace(id,durationMs,result.some((r)=>r.status==="error")))
+      this.store.recordScanSpans(id,traffic.spans??[]);
     if (durationMs > 25000) log.warn({run:id,durationMs},"Foreground scan exceeded 25 seconds");
     log.info(
       {

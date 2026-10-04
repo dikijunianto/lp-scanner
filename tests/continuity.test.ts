@@ -156,7 +156,7 @@ describe("Sprint 7 continuity",()=>{
       await vi.advanceTimersByTimeAsync(20000);
       await run;
       expect(scanner.running).toBe(false);
-      expect(store.scanLatency().p99Ms).toBe(20000);
+      expect(store.scanLatency().p99Ms).toBe(15000);
       expect(store.recentScanSpans().some((s)=>
         (s as {phase:string;success:number}).phase==="discovery" &&
         (s as {success:number}).success===0)).toBe(true);

@@ -8,7 +8,8 @@ const { createProgram, decodeAccount, deriveBinArray, binIdToBinArrayIndex, getB
   require("@meteora-ag/dlmm") as typeof import("@meteora-ag/dlmm");
 import { z } from "zod";
 import { env } from "../config/env";
-import type { Pool } from "../core/model";
+import type { Pool, Token } from "../core/model";
+import { approvedReferenceAssets, type PairPriceState, type PriceProvenance } from "../core/pricing";
 import {
   applyLiquidity,
   binPairPrice,
@@ -60,6 +61,7 @@ export function decodeBinArray(account: Account) {
 export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, now = Date.now()) {
   const started = Date.now();
   const targets = pools.slice(0, env.ACTIVE_LIQUIDITY_METEORA_LIMIT);
+  for (const pool of targets) (pool as Pool & { pairState?: PairPriceState }).pairState = undefined;
   for (const p of pools)
     unavailableLiquidity(
       p,
@@ -165,6 +167,38 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
             const amount0 = tokenUnits(bin.amountX.toString(), d0),
               amount1 = tokenUnits(bin.amountY.toString(), d1);
             const pairPrice = binPairPrice(pair.activeId, pair.binStep, d0, d1);
+            const observedAt = Math.max(now, Date.now());
+            const referenceTime = (token: Token): number | null => {
+              const provenance = (token as Token & { priceProvenance?: PriceProvenance | null }).priceProvenance;
+              const sources = provenance?.sources ?? [token.usdPriceSource ?? ""];
+              if (!approvedReferenceAssets.solana.includes(token.address) ||
+                  !["HIGH", "MEDIUM"].includes(token.usdPriceConfidence ?? "UNAVAILABLE") ||
+                  provenance?.kind === "CROSS_POOL" ||
+                  !sources.length || !sources.every((source) => /^(DefiLlama|CoinGecko|Pyth)/.test(source)) ||
+                  token.usdPrice == null || !Number.isFinite(token.usdPrice) || token.usdPrice <= 0 ||
+                  !fresh(token.usdPriceSourceTimestamp, observedAt, env.PRICE_MEDIUM_AGE_SECONDS * 1000) ||
+                  !fresh(token.usdPriceObservedAt, observedAt, env.ACTIVE_LIQUIDITY_PRICE_MAX_AGE_SECONDS * 1000) ||
+                  Math.abs(token.usdPriceSourceTimestamp! - blockTime) > env.CROSS_PRICE_MAX_ALIGNMENT_SECONDS * 1000) return null;
+              return token.usdPriceSourceTimestamp!;
+            };
+            const reference0 = referenceTime(pool.token0), reference1 = referenceTime(pool.token1);
+            // Only actual active-bin deposits of independently priced approved references count.
+            // This lower bound remains useful when the other token has no USD valuation.
+            const lowerBound = amount0.mul(reference0 === null ? 0 : pool.token0.usdPrice!)
+              .plus(amount1.mul(reference1 === null ? 0 : pool.token1.usdPrice!)).toNumber();
+            const numericPairPrice = pairPrice.toNumber();
+            if (!Number.isFinite(numericPairPrice) || numericPairPrice <= 0) throw new Error("Invalid pair price");
+            (pool as Pool & { pairState?: PairPriceState | null }).pairState = {
+              pairPrice: numericPairPrice, sourceTimestamp: blockTime, observedAt,
+              blockNumber: String(batch.context.slot), token0Address: pair.tokenXMint.toBase58(),
+              token1Address: pair.tokenYMint.toBase58(),
+              depositedLiquidityUsd: Number.isFinite(lowerBound) && lowerBound > 0 ? lowerBound : 0,
+              liquiditySourceTimestamp: Math.min(blockTime, reference0 ?? blockTime, reference1 ?? blockTime),
+              source: "Solana confirmed RPC active-bin deposits",
+            };
+            pool.token0.decimals = d0;
+            pool.token1.decimals = d1;
+            pool.binStep = pair.binStep;
             const pricing = priceEvidence(
               pool.token0,
               pool.token1,
@@ -173,9 +207,6 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
               env.ACTIVE_LIQUIDITY_PRICE_MAX_AGE_SECONDS * 1000,
               env.ACTIVE_LIQUIDITY_MAX_PRICE_DIVERGENCE,
             );
-            pool.token0.decimals = d0;
-            pool.token1.decimals = d1;
-            pool.binStep = pair.binStep;
             applyLiquidity(
               pool,
               {

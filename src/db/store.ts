@@ -107,8 +107,8 @@ export function createStore(path = env.DATABASE_PATH) {
     close: () => sqlite.close(),
     savePrices(records: PriceRecord[]) {
       const insert = sqlite.prepare(`INSERT INTO price_observations
-        (chain, asset_address, symbol, price_usd, source, source_timestamp, observed_at, block_number, confidence,resolution,algorithm_version)
-        VALUES (@chain, @assetAddress, @symbol, @priceUsd, @source, @sourceTimestamp, @observedAt, @blockNumber, @confidence,@resolution,@algorithmVersion)`);
+        (chain, asset_address, symbol, price_usd, source, source_timestamp, observed_at, block_number, confidence,resolution,algorithm_version,provenance_json)
+        VALUES (@chain, @assetAddress, @symbol, @priceUsd, @source, @sourceTimestamp, @observedAt, @blockNumber, @confidence,@resolution,@algorithmVersion,@provenanceJson)`);
       const duplicate=sqlite.prepare(`SELECT 1 FROM price_observations WHERE chain=? AND asset_address=?
         AND source_timestamp=? AND source=? AND price_usd=? LIMIT 1`);
       sqlite.transaction(() => {
@@ -116,7 +116,7 @@ export function createStore(path = env.DATABASE_PATH) {
           if(record.sourceTimestamp===null || duplicate.get(record.chain,record.assetAddress,
             record.sourceTimestamp,record.source,record.priceUsd)) continue;
           insert.run({ resolution: record.resolution ?? "REALTIME",
-            algorithmVersion: record.algorithmVersion ?? "sprint4-v1", ...record });
+            algorithmVersion: record.algorithmVersion ?? "sprint4-v1", provenanceJson:record.provenance?JSON.stringify(record.provenance):null, ...record });
         }
       })();
     },
@@ -141,6 +141,7 @@ export function createStore(path = env.DATABASE_PATH) {
             confidence: row.confidence as Confidence,
             resolution: (row.resolution ?? "REALTIME") as PriceRecord["resolution"],
             algorithmVersion: row.algorithm_version == null ? undefined : String(row.algorithm_version),
+            provenance: row.provenance_json?JSON.parse(String(row.provenance_json)):undefined,
           }
         : null;
     },

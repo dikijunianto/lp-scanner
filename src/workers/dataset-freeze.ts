@@ -9,10 +9,20 @@ import Database from "better-sqlite3";
 import { env } from "../config/env";
 
 const source=resolve(env.DATABASE_PATH),size=statSync(source).size;
+const gateDb=new Database(source,{readonly:true,fileMustExist:true});
+try {
+  const version=gateDb.prepare("SELECT version FROM dataset_versions ORDER BY valid_from DESC LIMIT 1").get() as {version:string}|undefined;
+  if(version?.version==='sprint9-v3') {
+    const row=gateDb.prepare("SELECT data FROM diagnostic_summaries WHERE id='current'").get() as {data:string}|undefined;
+    const summary=row?JSON.parse(row.data):null;
+    if(summary?.readiness?.status!=='READY' || Date.now()-summary.generatedAt>env.DIAGNOSTICS_MAX_AGE_SECONDS*1000)
+      throw new Error('Sprint9 dataset freeze requires fresh READY evidence for the complete 24-hour window');
+  }
+}finally{gateDb.close();}
 const disk=statfsSync(dirname(source));
 if(disk.bavail*disk.bsize<size+5*2**30)
   throw new Error("Insufficient free disk for a consistent dataset backup");
-const dir=resolve("data/datasets");mkdirSync(dir,{recursive:true});
+const dir=resolve(env.ARCHIVE_PATH,"datasets");mkdirSync(dir,{recursive:true});
 const base=resolve(dir,`dataset-${new Date().toISOString().replace(/[:.]/g,"-")}`);
 const temporary=`${base}.sqlite`,archive=`${base}.sqlite.gz`,manifestPath=`${base}.manifest.json`;
 const db=new Database(source,{readonly:true,fileMustExist:true});

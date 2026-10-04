@@ -95,9 +95,9 @@ export class RpcRouter extends ReadOnlyRpc {
         return score(b)-score(a);
       });
   }
-  private record(row: RpcProviderRow, success: boolean, latency: number, error?: string) {
+  private record(row: RpcProviderRow, success: boolean, latency: number|null, error?: string) {
     row.errorRate = row.errorRate * 0.8 + (success ? 0 : 0.2);
-    row.latencyMs = row.latencyMs === null ? latency : row.latencyMs * 0.7 + latency * 0.3;
+    if(latency!==null)row.latencyMs = row.latencyMs === null ? latency : row.latencyMs * 0.7 + latency * 0.3;
     if (success) { row.lastSuccessAt = Date.now(); row.consecutiveFailures = 0; row.cooldownUntil = 0;
       row.circuitState="CLOSED";row.failureReason=null; }
     else {
@@ -126,7 +126,7 @@ export class RpcRouter extends ReadOnlyRpc {
       }
       const rpc = new ReadOnlyRpc(p.url,new HttpClient(0,fetch,0,env.RPC_CALL_TIMEOUT_MS),10,p.row.supportsBatching !== false);
       if (method === "eth_getLogs") this.lastLogProvider = p.row;
-      const started = Date.now();
+      const started = Date.now(),monoStarted=performance.now();
       const logs = calls.filter((c) => c.method === "eth_getLogs").length;
       const blocks = calls.filter((c) => c.method === "eth_getBlockByNumber" && c.params[0] !== "latest").length;
       this.store.recordRpcRequest(p.row.providerId,minute(),calls.length,logs,blocks,i ? 1 : 0,requestCount);
@@ -138,7 +138,7 @@ export class RpcRouter extends ReadOnlyRpc {
             if (Date.now()-Number(BigInt(head.timestamp))*1000 > 120000) throw new Error("RPC_STALE_HEAD");
           }
         this.requests += rpc.requests;
-        this.record(p.row,true,Date.now()-started);
+        this.record(p.row,true,Math.abs(Date.now()-started-(performance.now()-monoStarted))>2000?null:performance.now()-monoStarted);
         this.lastProviderId=p.row.providerId;
         return result;
       } catch (error) {
@@ -151,7 +151,7 @@ export class RpcRouter extends ReadOnlyRpc {
         if (method === "eth_getLogs" && /disabled|not supported|method not found|403/i.test(message))
           p.row.supportsGetLogs = false;
         if (method === "eth_getLogs" && /archive/i.test(message)) p.row.supportsArchive = false;
-        this.record(p.row,false,Date.now()-started,message);
+        this.record(p.row,false,Math.abs(Date.now()-started-(performance.now()-monoStarted))>2000?null:performance.now()-monoStarted,message);
       }
     }
     throw last instanceof Error ? last : new Error("RPC_UNAVAILABLE");
@@ -164,16 +164,16 @@ export class RpcRouter extends ReadOnlyRpc {
     if(!other) return null;
     const usage=this.store.rpcUsage(other.row.providerId,this.chain,minute());
     if(usage.provider>=env.RPC_PROVIDER_REQUESTS_PER_MINUTE || usage.chain>=env.RPC_CHAIN_REQUESTS_PER_MINUTE) return null;
-    const started=Date.now();
+    const started=Date.now(),monoStarted=performance.now();
     this.store.recordRpcRequest(other.row.providerId,minute(),1,1,0,0);
     try {
       const raw=await new ReadOnlyRpc(other.url,new HttpClient(0,fetch,0,env.RPC_CALL_TIMEOUT_MS),1,false)
         .call("eth_getLogs",params);
-      this.record(other.row,true,Date.now()-started);
+      this.record(other.row,true,Math.abs(Date.now()-started-(performance.now()-monoStarted))>2000?null:performance.now()-monoStarted);
       this.requests++;
       return raw;
     } catch(error) {
-      this.record(other.row,false,Date.now()-started,error instanceof Error?error.message:"RPC error");
+      this.record(other.row,false,Math.abs(Date.now()-started-(performance.now()-monoStarted))>2000?null:performance.now()-monoStarted,error instanceof Error?error.message:"RPC error");
       return null;
     }
   }
