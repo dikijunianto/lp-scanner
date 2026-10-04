@@ -1,3 +1,4 @@
+import {feeEventAuditRow} from "../db/fee-invariants";
 import "dotenv/config";
 import Database from "better-sqlite3";
 import { gzipSync } from "node:zlib";
@@ -84,7 +85,7 @@ const report={archivePath:resolve(env.ARCHIVE_PATH),sameFilesystem,
 if(archiveApply) {
   const payload={format:"lp-scanner-archive-v1",createdAt:now,datasetVersion:"sprint7-v1",
     snapshots:snapshots.map(({id})=>({id,row:db.prepare("SELECT * FROM pool_snapshots WHERE rowid=?").get(id)})),
-    events:events.map(({id})=>({id,row:db.prepare("SELECT * FROM fee_events WHERE rowid=?").get(id)}))};
+    events:events.map(({id})=>({id,row:feeEventAuditRow(db,id)}))};
   if(payload.snapshots.length||payload.events.length) {
     const plain=Buffer.from(JSON.stringify(payload));
     const compressed=gzipSync(plain,{level:9});
@@ -106,7 +107,7 @@ if(archiveApply) {
         delSnapshot.run(item.id);
       }
       for(const item of payload.events) {
-        if(JSON.stringify(db.prepare("SELECT * FROM fee_events WHERE rowid=?").get(item.id))!==JSON.stringify(item.row))
+        if(JSON.stringify(feeEventAuditRow(db,item.id))!==JSON.stringify(item.row))
           throw new Error("Event changed during archival; no rows deleted");
         delEvent.run(item.id);
       }

@@ -397,18 +397,21 @@ export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
   const bootstrap=pool.chain==="bsc" ? env.BSC_LIVE_BOOTSTRAP_BLOCKS : env.BASE_LIVE_BOOTSTRAP_BLOCKS;
   const from=cursor ? cursor.blockNumber+1 : Math.max(0,confirmedBlock-bootstrap);
   const to=Math.min(confirmedBlock,from+env.LIVE_MAX_BLOCKS_PER_JOB-1);
-  if (from>to) return {indexed:0,cursor,headBlock,headTime,status:"CURRENT"};
-  let adaptiveTo=to,batch;
-  while(true){try{batch=await readRange(pool,rpc,store,from,adaptiveTo,"LIVE");break;}
-    catch(error){if(!isRangeError(error instanceof Error?error.message:String(error)) || adaptiveTo<=from)throw error;
-      adaptiveTo=from+Math.floor((adaptiveTo-from)/2);}}
+  let indexed=0;
+  if(from<=to) {
+    let adaptiveTo=to,batch;
+    while(true){try{batch=await readRange(pool,rpc,store,from,adaptiveTo,"LIVE");break;}
+      catch(error){if(!isRangeError(error instanceof Error?error.message:String(error)) || adaptiveTo<=from)throw error;
+        adaptiveTo=from+Math.floor((adaptiveTo-from)/2);}}
 
-  if(!cursor && prior && from>prior.blockNumber+1)
-    store.recordFeeGap(pool.id,prior.blockNumber+1,from-1,prior.endTime,batch.first.timestamp,
-      "LIVE_CURSOR_RESTART");
-  store.saveLiveFeeBatch(pool.id,pool.chain,batch.events,from,batch.first.timestamp,adaptiveTo,batch.last.hash,
-    batch.last.timestamp,headBlock,headTime,batch.sourceType,batch.sourceId);
-  cursor=store.liveFeeCursor(pool.id);
+    if(!cursor && prior && from>prior.blockNumber+1)
+      store.recordFeeGap(pool.id,prior.blockNumber+1,from-1,prior.endTime,batch.first.timestamp,
+        "LIVE_CURSOR_RESTART");
+    store.saveLiveFeeBatch(pool.id,pool.chain,batch.events,from,batch.first.timestamp,adaptiveTo,batch.last.hash,
+      batch.last.timestamp,headBlock,headTime,batch.sourceType,batch.sourceId);
+    cursor=store.liveFeeCursor(pool.id);
+    indexed=batch.events.length;
+  }
   if (!cursor) throw new Error("Live fee cursor not saved");
   store.resolveFeeGaps(pool.id,cursor.startBlock,cursor.blockNumber);
   const end=Math.floor(cursor.endTime/60000)*60000;
@@ -418,7 +421,7 @@ export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
     const coverageStart=Math.max(start,cursor.startTime),coverageEnd=Math.min(end,cursor.endTime);
     const coveragePct=feeCoveragePct(start,end,coverageStart,coverageEnd,gaps);
     const stale=confirmed.timestamp-cursor.endTime>180000;
-    const covered=coveragePct>=99.9 && !gaps.length && !stale;
+    const covered=store.liveCoverageComplete(pool.id,start,end) && coveragePct>=99.9 && !gaps.length && !stale;
     const data=store.materializedFeeWindow(pool.id,window,end,covered,
       cursor.startBlock,cursor.blockNumber);
     data.coverageStart=coverageStart;data.coverageEnd=coverageEnd;data.coveragePct=coveragePct;
@@ -427,6 +430,6 @@ export async function indexLiveEvmFees(pool:Pool,rpc:ReadOnlyRpc,store:Store) {
       data.methodology==="EVENT_DERIVED");
     store.saveFeeWindow(pool.id,window,data);
   }
-  return {indexed:batch.events.length,cursor,headBlock,headTime,
+  return {indexed,cursor,headBlock,headTime,
     status:confirmedBlock-cursor.blockNumber<=bootstrap/20 ? "CURRENT" : "CATCHING_UP"};
 }

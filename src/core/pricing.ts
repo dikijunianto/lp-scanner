@@ -1,4 +1,6 @@
 import type { Confidence, Pool, PriceRecord, Token } from "./model";
+import Decimal from "decimal.js";
+const D = Decimal.clone({ precision: 80 });
 
 export interface PricePolicy {
   highAgeMs: number;
@@ -122,6 +124,14 @@ export interface PriceProvenance {
   pairTimestamp?: number;
   pairPrice?: number;
   depositedLiquidityUsd?: number;
+  path?: PriceDerivationHop[];
+}
+export interface PriceDerivationHop {
+  poolId: string; poolAddress: string; source: string; blockNumber: string | null;
+  assetAddress: string; referenceAddress: string; pairPrice: number;
+  sourceTimestamp: number; observedAt: number; liquiditySourceTimestamp: number;
+  referenceDepositUsd: number; notionalReserveRatio: number;
+  priceImpact: number; impactMethodology: "DLMM_ACTIVE_BIN_NO_CROSS" | "V3_CURRENT_RANGE_SPOT";
 }
 export type EvidencedPrice = PriceRecord & { provenance?: PriceProvenance };
 export interface PairPriceState {
@@ -134,6 +144,12 @@ export interface PairPriceState {
   depositedLiquidityUsd: number;
   liquiditySourceTimestamp: number;
   source: string;
+  // Decimal-adjusted deposits read from actual token balances or bins, never virtual reserves.
+  depositedToken0Amount?: number;
+  depositedToken1Amount?: number;
+  execution?: { kind: "DLMM_BIN"; amount0: number; amount1: number } |
+    { kind: "V3_CURRENT_RANGE"; sqrtPriceX96: string; liquidityRaw: string; tick: number;
+      tickSpacing: number; decimals0: number; decimals1: number };
 }
 export interface CrossAssetPricePolicy {
   minimumLiquidityUsd: number;
@@ -142,6 +158,9 @@ export interface CrossAssetPricePolicy {
   maxPools: number;
   maxDerivations: number;
   approvedReferences?: Record<string, readonly string[]>;
+  maxHops?: number;
+  notionalUsd?: number;
+  maxPriceImpact?: number;
 }
 export const approvedReferenceAssets: Record<string, readonly string[]> = {
   solana: ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],
@@ -232,4 +251,120 @@ export function deriveCrossAssetPrices(
     if (results.length >= policy.maxDerivations) break;
   }
   return results;
+}
+
+function executionImpact(state: PairPriceState, targetIs0: boolean, referenceUsd: number,
+  targetUsd: number, notionalUsd: number): { impact: number; method: PriceDerivationHop["impactMethodology"] } | null {
+  const execution = state.execution;
+  if (!execution) return null;
+  if (execution.kind === "DLMM_BIN") {
+    const amount = targetIs0 ? execution.amount0 : execution.amount1;
+    // No fee subtraction overestimates output required, so this cannot understate bin depletion.
+    if (!Number.isFinite(amount) || amount <= 0 || new D(notionalUsd).div(targetUsd).gt(amount)) return null;
+    return { impact: 0, method: "DLMM_ACTIVE_BIN_NO_CROSS" };
+  }
+  if (!Number.isInteger(execution.tick) || Math.abs(execution.tick) > 887272 ||
+      !Number.isInteger(execution.tickSpacing) || execution.tickSpacing < 1 || execution.tickSpacing > 32767 ||
+      ![execution.decimals0, execution.decimals1].every(d => Number.isInteger(d) && d >= 0 && d <= 36) ||
+      !/^\d+$/.test(execution.liquidityRaw) || !/^\d+$/.test(execution.sqrtPriceX96)) return null;
+  try {
+    const liquidity = new D(execution.liquidityRaw), q = new D(execution.sqrtPriceX96);
+    if (liquidity.lte(0) || liquidity.gte(new D(2).pow(128)) || q.lte(0) || q.gte(new D(2).pow(160))) return null;
+    const sqrt = q.div(new D(2).pow(96));
+    const tickSqrt = new D("1.0001").pow(execution.tick).sqrt();
+    // slot0 may retain the preceding tick at an exact crossed boundary.
+    if (sqrt.lt(tickSqrt) || sqrt.gt(new D("1.0001").pow(execution.tick + 1).sqrt())) return null;
+    const actualPrice = sqrt.pow(2).mul(new D(10).pow(execution.decimals0 - execution.decimals1));
+    if (actualPrice.div(state.pairPrice).sub(1).abs().gt("0.00000001")) return null;
+    const lowerTick = Math.max(-887272, Math.floor(execution.tick / execution.tickSpacing) * execution.tickSpacing);
+    const upperTick = Math.min(887272, (Math.floor(execution.tick / execution.tickSpacing) + 1) * execution.tickSpacing);
+    const lower = new D("1.0001").pow(lowerTick).sqrt(), upper = new D("1.0001").pow(upperTick).sqrt();
+    if (sqrt.lt(lower) || sqrt.gt(upper)) return null;
+    const units = new D(notionalUsd).div(referenceUsd).mul(new D(10).pow(targetIs0 ? execution.decimals1 : execution.decimals0)).ceil();
+    // Include the whole input (fees only reduce actual movement), then reject any tick-spacing crossing.
+    const next = targetIs0 ? sqrt.plus(units.div(liquidity)) : liquidity.mul(sqrt).div(liquidity.plus(units.mul(sqrt)));
+    if (next.lte(lower) || next.gte(upper)) return null;
+    const impact = (targetIs0 ? next.div(sqrt).pow(2) : sqrt.div(next).pow(2)).sub(1).abs().toNumber();
+    return Number.isFinite(impact) ? { impact, method: "V3_CURRENT_RANGE_SPOT" } : null;
+  } catch { return null; }
+}
+
+// Bounded paths terminate in independent address-approved USD anchors. Deposited custody
+// establishes the liquidity floor; current executable state independently proves impact.
+export function derivePriceGraph(targetPool: Pool, token: Token, pools: Pool[],
+  anchors: PriceRecord[], now: number, policy: CrossAssetPricePolicy): EvidencedPrice[] {
+  const maxHops = policy.maxHops ?? 2, notionalUsd = policy.notionalUsd ?? 1000,
+    maxImpact = policy.maxPriceImpact ?? 0.01;
+  if (!Number.isFinite(now) || !Number.isInteger(maxHops) || maxHops < 1 || maxHops > 8 ||
+      !Number.isFinite(notionalUsd) || notionalUsd <= 0 || !Number.isFinite(maxImpact) || maxImpact <= 0 || maxImpact > 1 ||
+      !Number.isFinite(policy.minimumLiquidityUsd) || policy.minimumLiquidityUsd <= 0 ||
+      !Number.isFinite(policy.maxAgeMs) || policy.maxAgeMs <= 0 ||
+      !Number.isFinite(policy.maxAlignmentMs) || policy.maxAlignmentMs < 0 ||
+      !Number.isInteger(policy.maxPools) || policy.maxPools <= 0 ||
+      !Number.isInteger(policy.maxDerivations) || policy.maxDerivations <= 0) return [];
+  const chain = targetPool.chain, normalize = (a: string) => normalizedAddress(chain, a);
+  const approved = (policy.approvedReferences ?? approvedReferenceAssets)[chain] ?? [];
+  const fresh = (at: number | null) => at !== null && Number.isFinite(at) && at > 0 && at <= now + 30000 && now - at <= policy.maxAgeMs;
+  const direct = independentEvidence(anchors.filter(r => r.chain === chain && !isDerivedPrice(r) &&
+    !priceLineage(r).some(s => s.startsWith("Cross-pool USD")) &&
+    approved.some(a => normalize(a) === normalize(r.assetAddress)) && fresh(r.sourceTimestamp) && fresh(r.observedAt)));
+  const candidates = pools.slice(0, policy.maxPools).filter(p => p.chain === chain &&
+    p.id !== targetPool.id && normalize(p.poolAddress) !== normalize(targetPool.poolAddress));
+  const adjacent = new Map<string, Pool[]>();
+  for (const pool of candidates) for (const address of [normalize(pool.token0Address), normalize(pool.token1Address)]) {
+    const edges = adjacent.get(address) ?? [];
+    edges.push(pool); adjacent.set(address, edges);
+  }
+  let examined = 0;
+  type Quote = { price: number; anchor: PriceRecord; path: PriceDerivationHop[]; timestamps: number[]; observed: number[] };
+  const walk = (address: string, remaining: number, visited: Set<string>, usedPools: Set<string>): Quote[] => {
+    if (visited.has(address)) return [];
+    const seen = new Set(visited).add(address);
+    const quotes: Quote[] = direct.filter(r => normalize(r.assetAddress) === address).map(r => ({
+      price: r.priceUsd, anchor: r, path: [], timestamps: [r.sourceTimestamp!], observed: [r.observedAt],
+    }));
+    if (!remaining) return quotes;
+    for (const pool of adjacent.get(address) ?? []) {
+      // Bound dense graphs even when a larger hop limit is explicitly configured.
+      if (++examined > policy.maxPools * maxHops * 4) return quotes;
+      const poolKey = normalize(pool.poolAddress), state = pool.pairState;
+      if (usedPools.has(poolKey) || !state || !Number.isFinite(state.pairPrice) || state.pairPrice <= 0 ||
+          !fresh(state.sourceTimestamp) || !fresh(state.observedAt) || !fresh(state.liquiditySourceTimestamp)) continue;
+      const a0 = normalize(state.token0Address), a1 = normalize(state.token1Address);
+      const canonical = [normalize(pool.token0Address), normalize(pool.token1Address)];
+      if (a0 === a1 || !canonical.includes(a0) || !canonical.includes(a1)) continue;
+      const referenceAddress = address === a0 ? a1 : address === a1 ? a0 : null;
+      if (!referenceAddress || seen.has(referenceAddress)) continue;
+      const amount = address === a0 ? state.depositedToken1Amount : state.depositedToken0Amount;
+      if (amount == null || !Number.isFinite(amount) || amount <= 0) continue;
+      for (const reference of walk(referenceAddress, remaining - 1, seen, new Set(usedPools).add(poolKey))) {
+        const timestamps = [...reference.timestamps, state.sourceTimestamp, state.liquiditySourceTimestamp];
+        if (Math.max(...timestamps) - Math.min(...timestamps) > policy.maxAlignmentMs) continue;
+        const deposited = amount * reference.price, impact = notionalUsd / deposited;
+        if (!Number.isFinite(deposited) || deposited < policy.minimumLiquidityUsd || impact > maxImpact) continue;
+        const price = address === a0 ? state.pairPrice * reference.price : reference.price / state.pairPrice;
+        if (!Number.isFinite(price) || price <= 0) continue;
+        const executable = executionImpact(state, address === a0, reference.price, price, notionalUsd);
+        if (!executable || executable.impact > maxImpact) continue;
+        quotes.push({ price, anchor: reference.anchor, timestamps, observed: [...reference.observed, state.observedAt],
+          path: [{ poolId: pool.id, poolAddress: pool.poolAddress, source: state.source, blockNumber: state.blockNumber,
+            assetAddress: address, referenceAddress, pairPrice: state.pairPrice, sourceTimestamp: state.sourceTimestamp,
+            observedAt: state.observedAt, liquiditySourceTimestamp: state.liquiditySourceTimestamp,
+            referenceDepositUsd: deposited, notionalReserveRatio: impact,
+            priceImpact: executable.impact, impactMethodology: executable.method }, ...reference.path] });
+        if (quotes.length >= policy.maxDerivations) return quotes;
+      }
+    }
+    return quotes;
+  };
+  return walk(normalize(token.address), maxHops, new Set(), new Set()).filter(q => q.path.length)
+    .slice(0, policy.maxDerivations).map(q => ({ chain, assetAddress: normalize(token.address), symbol: token.symbol,
+      priceUsd: q.price, source: `Cross-pool USD (${q.path.map(p => p.poolAddress).join(" -> ")}; ${q.anchor.source})`,
+      sourceTimestamp: Math.min(...q.timestamps), observedAt: Math.min(...q.observed), blockNumber: q.path[0].blockNumber,
+      confidence: minConfidence(q.anchor.confidence, "MEDIUM"), provenance: { kind: "CROSS_POOL",
+        sources: [...priceLineage(q.anchor), ...q.path.map(p => `${p.source}:${p.poolAddress}`)],
+        poolId: q.path[0].poolId, poolAddress: q.path[0].poolAddress, referenceAddress: q.anchor.assetAddress,
+        referencePriceUsd: q.anchor.priceUsd, referenceSourceTimestamp: q.anchor.sourceTimestamp!,
+        referenceObservedAt: q.anchor.observedAt, depositedLiquidityUsd: Math.min(...q.path.map(p => p.referenceDepositUsd)),
+        path: q.path } }));
 }

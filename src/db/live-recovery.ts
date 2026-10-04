@@ -1,3 +1,4 @@
+import {createFeeEventWriter} from "./fee-invariants";
 import { statSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type { FeeEventRow } from "./store";
@@ -16,18 +17,16 @@ export function createLiveRecoveryStore(sqlite: Database.Database, databasePath:
         head_time headTime,source_type sourceType,source_id sourceId,updated_at updatedAt
         FROM live_fee_cursors WHERE pool_id=?`).get(poolId) as LiveCursor|undefined) ?? null;
     },
-    resetLiveFeeCursor(poolId:string) { sqlite.prepare("DELETE FROM live_fee_cursors WHERE pool_id=?").run(poolId); },
+    resetLiveFeeCursor(poolId:string) { sqlite.prepare("UPDATE live_coverage_intervals SET valid=0 WHERE pool_id=?").run(poolId); sqlite.prepare("DELETE FROM live_fee_cursors WHERE pool_id=?").run(poolId); },
     saveLiveFeeBatch(poolId:string, chain:string, events:FeeEventRow[], from:number, firstTime:number,
       to:number, hash:string, endTime:number, headBlock:number, headTime:number, sourceType:string, sourceId:string) {
       sqlite.transaction(() => {
-        const insert = sqlite.prepare(`INSERT OR IGNORE INTO fee_events
-          (pool_id,block_number,block_hash,tx_hash,log_index,timestamp,volume_usd,fees_usd,confidence,
-          chain,pool_address,amount0,amount1,price_usd0,price_usd1,gross_fee_usd,lp_fee_usd,fee_tier,protocol_fee_raw,price_confidence,sender,event_source_type,event_source_id)
-          VALUES (@poolId,@blockNumber,@blockHash,@txHash,@logIndex,@timestamp,@volumeUsd,@feesUsd,@confidence,
-          @chain,@poolAddress,@amount0,@amount1,@priceUsd0,@priceUsd1,@grossFeeUsd,@lpFeeUsd,@feeTier,@protocolFeeRaw,@priceConfidence,@sender,@eventSourceType,@eventSourceId)`);
-        for (const event of events) insert.run({poolAddress:null,amount0:null,amount1:null,
-          priceUsd0:null,priceUsd1:null,grossFeeUsd:null,lpFeeUsd:null,feeTier:null,
-          protocolFeeRaw:null,priceConfidence:null,sender:null,eventSourceType:null,eventSourceId:null,...event});
+        const previous=this.liveFeeCursor(poolId);
+        const intervalStart=previous && from===previous.blockNumber+1?previous.endTime:firstTime;
+        sqlite.prepare('INSERT OR REPLACE INTO live_coverage_intervals VALUES (?,?,?,?,?,?,?,1)')
+          .run(poolId,intervalStart,endTime,from,to,hash,sourceId);
+        const insert=createFeeEventWriter(sqlite);
+        for (const event of events) insert({...event,chain:event.chain??chain});
         sqlite.prepare(`INSERT INTO live_fee_cursors VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(pool_id) DO UPDATE SET block_number=excluded.block_number,
           block_hash=excluded.block_hash,end_time=excluded.end_time,head_block=excluded.head_block,

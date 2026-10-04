@@ -1,15 +1,19 @@
 import {env} from "../config/env";
-import {assessReadinessV3,type HourlySlo} from "../core/readiness-v3";
+import {assessReadinessV4,type HourlySloV4} from "../core/readiness-v4";
+import {providerServices} from "../core/provider-services";
+import {storageDelta,type StorageSample} from "../core/storage-accounting";
 import type {Store} from "../db/store";
 export function aggregateDiagnostics(store:Store) {
   const generatedAt=Date.now();
   const providers=store.rpcProviders();
   const bscProviders=providers.filter((p)=>p.chain==="bsc" && p.providerType==="CONFIGURED");
   const bscWebSocket=store.bscWsStatus();
-  const eventSources=store.eventSources() as {chain:string;purpose:string;healthState:string}[];
+  const eventSources=store.eventSources() as {chain:string;purpose:string;healthState:string;lastSuccessAt:number|null}[];
+  const fresh=(at:number|null)=>at!==null&&at<=generatedAt&&generatedAt-at<=180000;
+  const configuredLive=!!(env.BSC_LOG_RPC_URL || env.BSC_LOG_RPC_URLS || env.BSC_LOG_WSS_URL);
   const bscSource={
-    liveLogs:bscWebSocket?.status==="LIVE" || bscProviders.some((p)=>p.supportsGetLogs===true && p.healthState==="HEALTHY") ||
-      eventSources.some((s)=>s.chain==="bsc" && s.purpose==="LIVE" && s.healthState==="HEALTHY"),
+    liveLogs:configuredLive && (bscWebSocket?.status==="LIVE" && fresh(bscWebSocket.at) || bscProviders.some((p)=>p.supportsGetLogs===true && p.healthState==="HEALTHY") ||
+      eventSources.some((s)=>s.chain==="bsc" && s.purpose==="LIVE" && s.healthState==="HEALTHY" && fresh(s.lastSuccessAt))),
     historicalLogs:bscProviders.some((p)=>p.supportsGetLogs===true && p.healthState==="HEALTHY") ||
       eventSources.some((s)=>s.chain==="bsc" && s.purpose==="HISTORICAL" && s.healthState==="HEALTHY"),
     archiveState:bscProviders.some((p)=>p.supportsHistoricalState===true && p.healthState==="HEALTHY"),
@@ -31,15 +35,22 @@ export function aggregateDiagnostics(store:Store) {
   const hourly=store.hourlyCheckpoints();
   const windowStart=context?.startedAt??hourly[0]?.burninStartedAt??generatedAt;
   const scanWindow=store.scanWindow(windowStart,observationEnd);
-  const readiness=assessReadinessV3({foregroundP95Ms:scanLatency.p95Ms,
-    foregroundP99Ms:scanLatency.p99Ms,hot:hotCoverage,
-    snapshot:snapshotCoverage,outcomes:selectedOutcomeCoverage,
-    newOutcomeP95LagMs:newOutcomeLag.p95Ms,providers:[...providers,
-      ...eventSources.map((s)=>({...s,supportsGetLogs:true}))],diskDaysRemaining:diskSafety?.estimatedDaysRemaining??null,
-    growthBytesPerDay:measuredStorageGrowth.bytesPerDay,
-    growthHours:measuredStorageGrowth.hours},hourly as HourlySlo[],scanWindow,hourly.length?(hourly.at(-1).at-windowStart)/3600000:0);
+  const services=providerServices(store.serviceEvidence(generatedAt),generatedAt);
+  const epoch=store.validateResearchEpoch({snapshotPct:snapshotCoverage.coveragePct,largestGapMs:snapshotCoverage.largestGapMs,
+    breaches:scanWindow.breaches,services,integrityOk:store.integrityStatus()?.state!=='FAIL'},generatedAt);
+  const currentEpochOutcomes=epoch?store.epochOutcomeCoverage(generatedAt,epoch.id):store.epochOutcomeCoverage(generatedAt,'NO_EPOCH');
+  const allHistoryOutcomes=store.epochOutcomeCoverage(generatedAt);
+  const run=store.latestBurninRun();
+  const runData=run?JSON.parse(run.data):null;
+  const runStorage=runData?.storageBefore&&runData?.storageLast?storageDelta(runData.storageBefore as StorageSample,runData.storageLast as StorageSample):null;
+  const hours=run?.started_at?((run.ended_at??generatedAt)-run.started_at)/3600000:0;
+  const readiness=assessReadinessV4({epoch,outcomes:currentEpochOutcomes,services,history:hourly as HourlySloV4[],hours,
+    clockValid:runData?.clock?.valid===true,scans:scanWindow,storage:{hours:runStorage?.hours??0,
+      bytesPerDay:runStorage?.bytesPerDay??null,runwayDays:runStorage?.bytesPerDay&&runStorage.bytesPerDay>0?runData.storageLast.freeBytes/runStorage.bytesPerDay:null},bscLiveLogs:bscSource.liveLogs});
   return {
-  generatedAt,hotPoolDetails:store.hotPoolDetails(generatedAt),hourlySlo:hourly,scanWindow,
+  generatedAt,dbIntegrity:store.integrityStatus(),runStorage,epochLaunchHealth:store.epochLaunchHealth(generatedAt),researchEpoch:epoch,burninRunId:run?.id??null,providerServices:services,currentEpochOutcomes,allHistoryOutcomes,
+  baseLag:store.hotLagDistributions(generatedAt),baseFeeWaterfall:store.feeWaterfall(generatedAt),priceSourceCoverage:store.priceSourceCoverage(),wal:store.walStatus(),
+  hotPoolDetails:store.hotPoolDetails(generatedAt),hourlySlo:hourly,scanWindow,
   providers,bscSource, usage: store.recentRpcUsage(), priceCalls: store.recentPriceCalls(),
   coverage: store.coverage(), currentFees: store.currentFeeCoverage(),
   historicalFees: store.historicalFeeCoverage(), priceBackfill: store.priceBackfillProgress(),

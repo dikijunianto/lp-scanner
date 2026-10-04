@@ -45,8 +45,9 @@ export class BackgroundWorker {
       }
       if(this.mode==="all"||this.mode==="depth") {
       const protectedSignals=this.store.activeSignalIds();
+      const depthQueued=new Set(this.store.pendingDepthIds());
       const snapshots = this.store.list().filter(s=>disk!=="CRITICAL" || watched.has(s.pool.id) || protectedSignals.has(s.pool.id) || priorityTier(s.pool,false,s.metrics,priorityPolicy())===1);
-      const ranked=snapshots.sort((a,b)=>priorityScore(b.pool,watched.has(b.pool.id),b.metrics,priorityPolicy())-
+      const ranked=snapshots.sort((a,b)=>Number(depthQueued.has(b.pool.id))-Number(depthQueued.has(a.pool.id)) || priorityScore(b.pool,watched.has(b.pool.id),b.metrics,priorityPolicy())-
         priorityScore(a.pool,watched.has(a.pool.id),a.metrics,priorityPolicy()));
       const sol=ranked.filter((s)=>s.pool.chain==="solana").map((s)=>s.pool);
       const base=ranked.filter((s)=>s.pool.chain==="base").map((s)=>s.pool);
@@ -54,6 +55,7 @@ export class BackgroundWorker {
         sol.length?enrichMeteoraDepth(sol,new RpcRouter("solana",this.store),this.store,false,watched):Promise.resolve(""),
         base.length?enrichEvmDepth(base,new RpcRouter("base",this.store),this.store,false,watched):Promise.resolve(""),
       ]);
+      for(const pool of [...sol,...base])if(pool.depthState==='CURRENT' && (pool.depthExpiresAt??0)>Date.now())this.store.finishDepthRefresh(pool.id);
       for(const result of depth) if(result.status==="fulfilled" && result.value) notes.push(result.value);
       if(Date.now()-this.lastProbeAt>=env.RPC_PROBE_INTERVAL_SECONDS*1000) {
         this.lastProbeAt=Date.now();
@@ -143,7 +145,7 @@ export class BackgroundWorker {
         /* A failed cycle is recorded and retried later. */
       } finally {
         if (!this.stopped) this.timer = setTimeout(loop,
-          Math.max(this.mode==="history"?60000:0,env.BACKGROUND_INTERVAL_SECONDS*1000));
+          Math.max(this.mode==="history"?60000:0,(this.mode==="depth"?5:env.BACKGROUND_INTERVAL_SECONDS)*1000));
       }
     };
     this.timer=setTimeout(loop,this.mode==="depth"?5000:this.mode==="history"?15000:0);

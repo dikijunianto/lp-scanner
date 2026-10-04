@@ -1,0 +1,11 @@
+# Storage attribution and sustainability
+
+Use identical SQLite dbstat object allocation, file sizes, WAL bytes and freelist bytes at observation start/end. Each table and index is measured independently; row counts are retained for audit. Growth is conservatively max(occupied-page delta, DB+WAL file delta,0), annualized by the actual storage-profile interval. Freelist is reported separately, not added twice.
+
+Sprint9 measured about0.4567GiB/day; full snapshots0.0862, fee-event table+indexes0.1490, WAL0.0915. These are prior measurements, not Sprint10 results. Future full snapshots use lossless native deflate only if smaller; legacy rows remain readable. Minute numeric core samples remain unchanged. Oversized values stay plain under the bounded decoder.
+
+Future fee events reference immutable address/source tuples, while raw amounts, transaction/log identity, block hashes, fees and valuation remain auditable. Legacy events remain unchanged and readers/archive exports resolve both representations. Fee-window materialization remains the existing small numeric JSON record; it has no raw decoded payload. A wholesale schema rewrite is deferred until measured savings justify it. Publication dedup keys asset/chain/source/timestamp/price; coverage refresh remains separate.
+
+PASSIVE checkpoints run no more than once per minute and report duration, result, pending frames and WAL bytes. Owned synchronous read scopes are tracked; global oldest reader age is UNKNOWN because SQLite does not expose other processes' read ownership. No forced live truncation, VACUUM or archival. Candidate duplicate indexes remain because hot-query latency preservation was not proven.
+
+The0.15GiB/day target and120day minimum runway require actual24h data. Below120days, report EXTERNAL_STORAGE_REQUIRED. Prepare external backup/archive storage manually; keep the live DB internal. For a Mac-only external disk, use [APFS](https://support.apple.com/en-gb/guide/disk-utility/dsku19ed921c/22.7/mac/26), a stable mount path, enough free space for a consistent backup, verify SHA256 and full integrity after restoring a copy, then document the path before changing ARCHIVE_PATH. Do not move or erase live history automatically. Retain a separate verified backup; an external volume is not itself redundancy.
