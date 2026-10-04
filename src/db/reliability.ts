@@ -126,17 +126,17 @@ export function createReliabilityStore(sqlite: Database.Database) {
       return sqlite.prepare(`SELECT e.pool_id poolId,e.chain,e.tx_hash txHash,e.log_index logIndex,
         ROW_NUMBER() OVER (PARTITION BY e.pool_id ORDER BY e.timestamp DESC) pool_rank,
         e.timestamp,e.amount0,e.amount1,e.protocol_fee_raw protocolFeeRaw,e.fee_tier feeTier,
-        json_extract(p.data,'$.pool.activeLiquidityDetails.token0Address') token0Address,
-        json_extract(p.data,'$.pool.activeLiquidityDetails.token1Address') token1Address,
-        json_extract(p.data,'$.pool.activeLiquidityDetails.decimals0') decimals0,
-        json_extract(p.data,'$.pool.activeLiquidityDetails.decimals1') decimals1,
+        COALESCE(json_extract(p.data,'$.pool.activeLiquidityDetails.token0Address'),json_extract(p.data,'$.pool.token0.address')) token0Address,
+        COALESCE(json_extract(p.data,'$.pool.activeLiquidityDetails.token1Address'),json_extract(p.data,'$.pool.token1.address')) token1Address,
+        COALESCE(json_extract(p.data,'$.pool.activeLiquidityDetails.decimals0'),json_extract(p.data,'$.pool.token0.decimals')) decimals0,
+        COALESCE(json_extract(p.data,'$.pool.activeLiquidityDetails.decimals1'),json_extract(p.data,'$.pool.token1.decimals')) decimals1,
         json_extract(p.data,'$.pool.token0.symbol') symbol0,
         json_extract(p.data,'$.pool.token1.symbol') symbol1
         FROM fee_events e JOIN pools p ON p.id=e.pool_id
         LEFT JOIN price_backfill_attempts a ON a.pool_id=e.pool_id AND a.tx_hash=e.tx_hash AND a.log_index=e.log_index
         WHERE e.volume_usd IS NULL AND e.amount0 IS NOT NULL AND e.amount1 IS NOT NULL
         AND (a.retry_at IS NULL OR a.retry_at<=?)
-        ORDER BY pool_rank,e.timestamp DESC LIMIT ?`).all(Date.now(), limit) as UnpricedEvent[];
+        ORDER BY CASE WHEN e.chain='base' AND e.timestamp>=CAST(strftime('%s','now') AS INTEGER)*1000-3600000 THEN 0 ELSE 1 END,pool_rank,e.timestamp DESC LIMIT ?`).all(Date.now(), limit) as UnpricedEvent[];
     },
     cachedHistoricalPrice(chain: string, address: string, bucket: number, source: string) {
       return sqlite.prepare(`SELECT * FROM historical_price_cache WHERE chain=? AND asset_address=? AND bucket_start=? AND source=?`)

@@ -1,12 +1,13 @@
 import { z } from "zod";
 import { env } from "../config/env";
 import type { Pool, PriceRecord, Token } from "../core/model";
-import { applyPrice, priceConfidence, priceConsensus, minConfidence, independentEvidence, priceLineage, deriveCrossAssetPrices, isDerivedPrice, type PricePolicy, type CrossAssetPricePolicy, type PriceProvenance, type EvidencedPrice } from "../core/pricing";
+import { applyPrice, priceConfidence, priceConsensus, minConfidence, independentEvidence, priceLineage, derivePriceGraph, isDerivedPrice, type PricePolicy, type CrossAssetPricePolicy, type PriceProvenance, type EvidencedPrice } from "../core/pricing";
 import type { Store } from "../db/store";
 import { HttpClient } from "./http";
 
 const llama = new HttpClient(250);
 const gecko = new HttpClient(1100, fetch, 0);
+let fallbackRotation=0;
 const llamaResponse = z.object({ coins: z.record(z.string(), z.unknown()) });
 const llamaCoin = z.object({
   price: z.number().finite().positive(),
@@ -281,8 +282,10 @@ export async function enrichPrices(
     byKey.get(key)?.some((r) => ["HIGH", "MEDIUM"].includes(r.confidence)),
   );
   const crossCheckCount = Math.min(4, Math.floor(env.PRICE_FALLBACK_LIMIT / 4));
+  const rotation=stale.length?fallbackRotation++%stale.length:0;
+  const fairStale=[...stale.slice(rotation),...stale.slice(0,rotation)];
   const fallbackKeys = [
-    ...stale.slice(0, env.PRICE_FALLBACK_LIMIT - crossCheckCount),
+    ...fairStale.slice(0, env.PRICE_FALLBACK_LIMIT - crossCheckCount),
     ...current.slice(0, crossCheckCount),
   ].slice(0, env.PRICE_FALLBACK_LIMIT);
   const fallback = await fetchSource(options.fallbackSource ?? geckoSource, fallbackKeys);
@@ -338,7 +341,7 @@ export async function enrichPrices(
     const key = keyFor(pool, token);
     if (options.derivationPolicy && !["HIGH", "MEDIUM"].includes(token.usdPriceConfidence ?? "UNAVAILABLE") &&
         !failures.get(key)?.some((f) => f.reason === "DISAGREEMENT")) {
-      const evidence = deriveCrossAssetPrices(pool, token, pools, referenceRecords, Date.now(), options.derivationPolicy);
+      const evidence = derivePriceGraph(pool, token, pools, referenceRecords, Date.now(), options.derivationPolicy);
       const consensus = priceConsensus(evidence, env.PRICE_CONSENSUS_HIGH_DEVIATION_PCT, env.PRICE_CONSENSUS_MEDIUM_DEVIATION_PCT);
       if (evidence.length && consensus.medianPrice !== null && consensus.confidence !== "UNAVAILABLE") {
         // Select an actual derivation so persisted provenance identifies the pool to exclude.
@@ -354,6 +357,10 @@ export async function enrichPrices(
     if (!["HIGH", "MEDIUM"].includes(token.usdPriceConfidence ?? "UNAVAILABLE") && !failures.get(key)?.length)
       failure(failures, key, "Pricing", "NO_RELIABLE_SOURCE");
     (token as PriceToken).priceFailures = failures.get(key) ?? [];
+  }
+  for(const [key,items] of failures) {
+    const asset=assets.get(key)!;
+    for(const f of items)store?.recordPriceSource(asset.pool.chain,asset.token.address,f.source,false,f.observedAt,{reason:f.reason});
   }
   records.push(...primary, ...fallback);
   return {
@@ -382,6 +389,8 @@ export function applyCachedPrices(pools:Pool[],store:Store) {
     }
     if (isDerivedPrice(record)) {
       const provenance = (record as EvidencedPrice).provenance;
+      if (provenance?.path?.some(hop=>hop.poolId===pool.id ||
+        (pool.chain==='solana'?hop.poolAddress===pool.poolAddress:hop.poolAddress.toLowerCase()===pool.poolAddress.toLowerCase())))continue;
       if (!provenance?.poolId || !provenance.poolAddress || provenance.poolId === pool.id || (pool.chain==='solana'?provenance.poolAddress===pool.poolAddress:provenance.poolAddress.toLowerCase()===pool.poolAddress.toLowerCase())) continue;
     }
     const confidence=minConfidence(record.confidence, priceConfidence(record.sourceTimestamp,record.observedAt,Date.now(),

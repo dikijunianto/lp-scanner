@@ -37,7 +37,7 @@ export class LiveEventWorker {
       const sources=this.store.rpcProviders().filter((p)=>p.chain==="bsc" &&
         p.providerType==="CONFIGURED" && p.supportsGetLogs===true && p.healthState==="HEALTHY");
       if(!sources.length && !env.BSC_LIVE_INDEXER_URL) {
-        await new RpcRouter("bsc",this.store).probeAll();
+        await new RpcRouter("bsc",this.store,undefined,"LIVE").probeAll();
         const capable=this.store.rpcProviders().some((p)=>p.chain==="bsc" &&
           p.providerType==="CONFIGURED" && p.supportsGetLogs===true && p.healthState==="HEALTHY");
         if(!capable) {
@@ -74,7 +74,7 @@ export class LiveEventWorker {
     const selected=ranked.slice(0,env.LIVE_POOLS_PER_CYCLE);
     const results=await Promise.all(selected.map(async({s})=>{
       try {
-        const rpc=new RpcRouter(this.chain,this.store);
+        const rpc=new RpcRouter(this.chain,this.store,undefined,"LIVE");
         if(!s.pool.activeLiquidityDetails)await enrichEvmLiquidity([s.pool],this.chain,rpc);
         const result=await indexLiveEvmFees(s.pool,rpc,this.store);
         const window=this.store.latestFeeWindows(s.pool.id)['1h'];

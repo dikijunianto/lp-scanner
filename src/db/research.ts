@@ -1,3 +1,4 @@
+import {decodeSnapshot} from "../core/snapshot-codec";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import type { EvidencedPrice } from "../core/pricing";
@@ -49,6 +50,7 @@ export interface SignalRow {
   activityScoreVersion: string;
   riskScoreVersion: string;
   signalRuleVersion: string;
+  researchEpochId: string | null;
   reasonJson: string;
   data: Snapshot;
 }
@@ -60,7 +62,7 @@ export interface OutcomeRow {
   completedAt: number | null;
   data: Outcome | null;
 }
-const json = (s: string) => JSON.parse(s) as Snapshot;
+const json = (s: string) => decodeSnapshot(JSON.parse(s) as Snapshot);
 const signal = (row: Record<string, unknown>): SignalRow => ({
   id: Number(row.id),
   poolId: String(row.pool_id),
@@ -73,6 +75,7 @@ const signal = (row: Record<string, unknown>): SignalRow => ({
   activityScoreVersion: String(row.activity_score_version),
   riskScoreVersion: String(row.risk_score_version),
   signalRuleVersion: String(row.signal_rule_version),
+  researchEpochId: row.research_epoch_id==null?null:String(row.research_epoch_id),
   reasonJson: String(row.reason_json),
   data: json(String(row.data)),
 });
@@ -269,6 +272,7 @@ export function createResearchStore(sqlite: Database.Database) {
       ancestor?: { blockNumber: number; blockHash: string; timestamp: number },
     ) {
       sqlite.transaction(() => {
+        sqlite.prepare('UPDATE live_coverage_intervals SET valid=0 WHERE pool_id=? AND end_block>=?').run(poolId,fromBlock);
         sqlite
           .prepare("DELETE FROM fee_events WHERE pool_id=? AND block_number>=?")
           .run(poolId, fromBlock);
@@ -399,13 +403,15 @@ export function createResearchStore(sqlite: Database.Database) {
     },
     syncSignals(s: Snapshot, policy: SignalPolicy): number[] {
       const found = detectSignals(s, policy);
+      const epoch=sqlite.prepare("SELECT id FROM research_epochs WHERE status='ACTIVE'").get() as {id:string}|undefined;
+      const epochId=['solana','base'].includes(s.pool.chain)?epoch?.id??null:null;
       const created: number[] = [];
       sqlite.transaction(() => {
         const active = sqlite
           .prepare(
-            "SELECT id,signal_type,peak_score FROM signal_episodes WHERE pool_id=? AND episode_end IS NULL",
+            "SELECT id,signal_type,peak_score FROM signal_episodes WHERE pool_id=? AND episode_end IS NULL AND research_epoch_id IS ?",
           )
-          .all(s.pool.id) as { id: number; signal_type: SignalType; peak_score: number | null }[];
+          .all(s.pool.id,epochId) as { id: number; signal_type: SignalType; peak_score: number | null }[];
         for (const old of active) {
           const match = found.find((m) => m.type === old.signal_type);
           if (match)
@@ -423,8 +429,8 @@ export function createResearchStore(sqlite: Database.Database) {
               sqlite
                 .prepare(
                   `INSERT INTO signal_episodes
-            (pool_id,signal_type,episode_start,episode_last_seen,peak_score,scanner_version,activity_score_version,risk_score_version,signal_rule_version,reason_json,data,sample_meta)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            (pool_id,signal_type,episode_start,episode_last_seen,peak_score,scanner_version,activity_score_version,risk_score_version,signal_rule_version,reason_json,data,sample_meta,research_epoch_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
                 )
                 .run(
                   s.pool.id,
@@ -451,13 +457,14 @@ export function createResearchStore(sqlite: Database.Database) {
                       SUM(health_state='HEALTHY') healthy FROM rpc_providers WHERE chain=?`)
                       .get(s.pool.chain) as {n:number;healthy:number|null};
                       return health.n ? !health.healthy : null;})()}),
+                  epochId,
                 ).lastInsertRowid,
             );
             created.push(id);
             for (const [h, ms] of Object.entries(horizons))
               sqlite
-                .prepare("INSERT INTO signal_outcomes(signal_id,horizon,due_at) VALUES (?,?,?)")
-                .run(id, h, s.pool.timestamp + ms);
+                .prepare("INSERT INTO signal_outcomes(signal_id,horizon,due_at,research_epoch_id) VALUES (?,?,?,?)")
+                .run(id, h, s.pool.timestamp + ms,epochId);
           }
       })();
       return created;
@@ -470,7 +477,7 @@ export function createResearchStore(sqlite: Database.Database) {
       const rows = sqlite
         .prepare(
           `SELECT * FROM (SELECT o.*,s.data signal_data,s.id signal_id_full,s.pool_id,s.signal_type,s.episode_start,s.episode_last_seen,s.episode_end,s.peak_score,
-        s.scanner_version,s.activity_score_version,s.risk_score_version,s.signal_rule_version,s.reason_json,
+        s.scanner_version,s.activity_score_version,s.risk_score_version,s.signal_rule_version,s.reason_json,s.research_epoch_id,
         ROW_NUMBER() OVER(PARTITION BY o.horizon ORDER BY o.due_at ASC,s.id ASC) horizon_rank
         FROM signal_outcomes o JOIN signal_episodes s ON s.id=o.signal_id
         WHERE o.status IN ('PENDING','READY') AND o.due_at+?<=?)
@@ -494,7 +501,7 @@ export function createResearchStore(sqlite: Database.Database) {
       if(limit<=0) return 0;
       const now=Date.now();
       const candidates=sqlite.prepare(`SELECT o.signal_id,o.horizon,o.due_at,o.attempts,
-        s.pool_id,s.episode_start,s.data signal_data,r.input_hash
+        s.pool_id,s.episode_start,s.research_epoch_id,s.data signal_data,r.input_hash
         FROM signal_outcomes o JOIN signal_episodes s ON s.id=o.signal_id
         LEFT JOIN outcome_retry_state r ON r.signal_id=o.signal_id AND r.horizon=o.horizon
         WHERE o.status IN ('PARTIAL','UNAVAILABLE','PRICE_RANGE_COMPLETE') AND o.attempts<3
@@ -502,12 +509,12 @@ export function createResearchStore(sqlite: Database.Database) {
           AND COALESCE(r.last_checked_at,0)<=?-60000
         ORDER BY COALESCE(r.last_checked_at,0),o.due_at ASC LIMIT ?`).all(now,now,limit*4) as {
           signal_id:number;horizon:Horizon;due_at:number;pool_id:string;episode_start:number;
-          signal_data:string;input_hash:string|null}[];
+          signal_data:string;input_hash:string|null;research_epoch_id:string|null}[];
       let queued=0;
       for(const row of candidates) {
         const base=json(row.signal_data);
         const history=this.outcomeHistory(row.pool_id,row.episode_start,
-          row.due_at+env.OUTCOME_MAX_GAP_SECONDS*1000,base);
+          row.due_at+env.OUTCOME_MAX_GAP_SECONDS*1000,base,!!row.research_epoch_id);
         const generated=base.pool.chain==="solana" ? {fees:null,volume:null} :
           this.generatedFees(row.pool_id,row.episode_start,row.due_at);
         const hash=outcomeInputHash(history,generated);
@@ -535,8 +542,8 @@ export function createResearchStore(sqlite: Database.Database) {
         .run(status, Date.now(), JSON.stringify(data),data.overallCompletenessPct??data.outcomeCompletenessPct??null,
           JSON.stringify(data.missingReasons??[]),signalId, horizon);
     },
-    outcomeHistory(poolId: string, from: number, to: number, base?:Snapshot): Snapshot[] {
-      const full=(
+    outcomeHistory(poolId: string, from: number, to: number, base?:Snapshot, cleanEpoch=false): Snapshot[] {
+      const full=cleanEpoch?[]:(
         sqlite
           .prepare(
             "SELECT data FROM pool_snapshots WHERE pool_id=? AND timestamp>? AND timestamp<=? ORDER BY timestamp",
@@ -549,7 +556,7 @@ export function createResearchStore(sqlite: Database.Database) {
         active_liquidity_usd activeLiquidityUsd,depth5_usd depth5Usd,volatility_1h volatility1h
         FROM core_snapshots WHERE pool_id=? AND timestamp>? AND timestamp<=? AND price IS NOT NULL
         ORDER BY timestamp`).all(poolId,from,to) as CoreSnapshotRow[];
-      const compact=core.map((r)=>({
+      const compact=core.filter(r=>!cleanEpoch || ["HIGH","MEDIUM"].includes(r.priceConfidence)).map((r)=>({
         ...base,
         pool:{...base.pool,timestamp:r.timestamp,price:r.price,volume1h:r.volume1h,
           fees1h:r.fees1h,activeLiquidityUsd:r.activeLiquidityUsd,depth5PctUsd:null,
@@ -560,7 +567,7 @@ export function createResearchStore(sqlite: Database.Database) {
           feeEfficiency1h:null,volumeDepthRatio1h:null},
       }));
       const byTime=new Map<number,Snapshot>(compact.map((s)=>[s.pool.timestamp,s]));
-      for(const s of full) byTime.set(s.pool.timestamp,s);
+      if(!cleanEpoch)for(const s of full) byTime.set(s.pool.timestamp,s);
       return [...byTime.values()].sort((a,b)=>a.pool.timestamp-b.pool.timestamp);
     },
     async evaluateDueOutcomes(policy: SignalPolicy, now = Date.now(), limit = 10, concurrency = 1) {
@@ -579,14 +586,14 @@ export function createResearchStore(sqlite: Database.Database) {
           await new Promise<void>((resolve)=>setImmediate(resolve));
           try {
             const end=outcome.dueAt+policy.maxObservationGapMs;
-            const history=this.outcomeHistory(row.poolId,row.episodeStart,end,row.data);
+            const history=this.outcomeHistory(row.poolId,row.episodeStart,end,row.data,!!row.researchEpochId);
             const generated=row.data.pool.chain==="solana" ? {fees:null,volume:null}
               : this.generatedFees(row.poolId,row.episodeStart,outcome.dueAt);
             sqlite.prepare(`INSERT INTO outcome_retry_state(signal_id,horizon,input_hash,last_attempt_at,last_checked_at)
               VALUES (?,?,?,?,?) ON CONFLICT(signal_id,horizon) DO UPDATE SET input_hash=excluded.input_hash,
               last_attempt_at=excluded.last_attempt_at,last_checked_at=excluded.last_checked_at`).run(row.id,outcome.horizon,
                 outcomeInputHash(history,generated)??"",now,now);
-            const data=evaluateOutcome(row.data,history,outcome.horizon,policy,generated);
+            const data=evaluateOutcome(row.data,history,outcome.horizon,policy,generated,row.researchEpochId?{minimumDensityPct:env.EPOCH_PRICE_DENSITY_PCT,maxGapMs:env.EPOCH_MAX_PRICE_GAP_SECONDS*1000}:undefined);
             const status=data.completenessClasses?.includes("FULL_COMPLETE") ? "COMPLETE" :
               data.completenessClasses?.includes("PRICE_RANGE_COMPLETE") ? "PRICE_RANGE_COMPLETE" :
               (data.overallCompletenessPct??0)>0 ? "PARTIAL" : "UNAVAILABLE";
@@ -734,7 +741,7 @@ export function createResearchStore(sqlite: Database.Database) {
         AND json_extract(data,'$.pool.feeTier') IS NOT NULL ORDER BY timestamp DESC LIMIT 1`,
         )
         .get(poolId) as { data: string } | undefined;
-      return row ? (JSON.parse(row.data) as Snapshot).pool : null;
+      return row ? json(row.data).pool : null;
     },
   };
 }

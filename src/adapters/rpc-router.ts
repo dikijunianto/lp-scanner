@@ -42,11 +42,17 @@ export function providerFailureReason(message:string) {
   if (/unsupported|method not found|403|capability/i.test(message)) return "UNSUPPORTED_METHOD";
   return "SERVER_ERROR";
 }
+export function rpcRequestCeilings(purpose:"LIVE"|"OTHER", providerLimit:number,
+  chainLimit:number, reserved:number) {
+  return {provider:providerLimit-(purpose==="LIVE"?0:Math.min(reserved,Math.floor(providerLimit/2))),
+    chain:chainLimit-(purpose==="LIVE"?0:Math.min(reserved,Math.floor(chainLimit/2)))};
+}
 export class RpcRouter extends ReadOnlyRpc {
   private providers: { url: string; row: RpcProviderRow }[];
   private lastLogProvider: RpcProviderRow | null = null;
   lastProviderId: string | null = null;
-  constructor(public chain: "solana" | "base" | "bsc", private store: Store, urls = rpcUrls(chain)) {
+  constructor(public chain: "solana" | "base" | "bsc", private store: Store, urls = rpcUrls(chain),
+    private purpose:"LIVE"|"OTHER"="OTHER") {
     super("https://unused.invalid");
     const saved = new Map(store.rpcProviders().map((r) => [r.providerId,r]));
     this.providers = urls.map((url, index) => {
@@ -65,6 +71,11 @@ export class RpcRouter extends ReadOnlyRpc {
     });
   }
   get providerCount() { return this.providers.length; }
+  private allows(usage:{provider:number;chain:number}, requests:number) {
+    const limits=rpcRequestCeilings(this.purpose,env.RPC_PROVIDER_REQUESTS_PER_MINUTE,
+      env.RPC_CHAIN_REQUESTS_PER_MINUTE,this.chain==="solana"?0:env.RPC_LIVE_RESERVED_REQUESTS_PER_MINUTE);
+    return usage.provider+requests<=limits.provider && usage.chain+requests<=limits.chain;
+  }
   get lastLogSourceId() { return this.lastLogProvider?.providerId ?? null; }
   get safeLogRange() {
     const capable = this.ordered("eth_getLogs",[]);
@@ -120,8 +131,7 @@ export class RpcRouter extends ReadOnlyRpc {
     for (let i=0; i<Math.min(ordered.length,3); i++) {
       const p = ordered[i], usage = this.store.rpcUsage(p.row.providerId,this.chain,minute());
       const requestCount = p.row.supportsBatching === false ? calls.length : Math.ceil(calls.length/10);
-      if (usage.provider+requestCount > env.RPC_PROVIDER_REQUESTS_PER_MINUTE ||
-        usage.chain+requestCount > env.RPC_CHAIN_REQUESTS_PER_MINUTE) {
+      if (!this.allows(usage,requestCount)) {
         last = new Error("RPC_REQUEST_BUDGET_EXHAUSTED"); continue;
       }
       const rpc = new ReadOnlyRpc(p.url,new HttpClient(0,fetch,0,env.RPC_CALL_TIMEOUT_MS),10,p.row.supportsBatching !== false);
@@ -163,7 +173,7 @@ export class RpcRouter extends ReadOnlyRpc {
       .find((p)=>p.row.providerId!==this.lastProviderId && p.row.supportsGetLogs===true);
     if(!other) return null;
     const usage=this.store.rpcUsage(other.row.providerId,this.chain,minute());
-    if(usage.provider>=env.RPC_PROVIDER_REQUESTS_PER_MINUTE || usage.chain>=env.RPC_CHAIN_REQUESTS_PER_MINUTE) return null;
+    if(!this.allows(usage,1)) return null;
     const started=Date.now(),monoStarted=performance.now();
     this.store.recordRpcRequest(other.row.providerId,minute(),1,1,0,0);
     try {
@@ -182,41 +192,50 @@ export class RpcRouter extends ReadOnlyRpc {
       if (p.row.lastProbeAt && Date.now()-p.row.lastProbeAt < env.RPC_PROBE_INTERVAL_SECONDS*1000) return;
       if (p.row.circuitState==="OPEN" && p.row.cooldownUntil>Date.now()) return;
       if (p.row.circuitState==="OPEN") p.row.circuitState="HALF_OPEN";
-      const usage = this.store.rpcUsage(p.row.providerId,this.chain,minute());
-      if (usage.provider+8 > env.RPC_PROVIDER_REQUESTS_PER_MINUTE ||
-        usage.chain+8 > env.RPC_CHAIN_REQUESTS_PER_MINUTE) return;
+      const probeMinute=minute();
+      const usage = this.store.rpcUsage(p.row.providerId,this.chain,probeMinute);
+      if (!this.allows(usage,8)) return;
+      // Reserve before any await; concurrent probes cannot spend the live slice.
+      this.store.recordRpcRequest(p.row.providerId,probeMinute,8,0,0,0,8);
+      let probeRequests=0,probeCalls=0;
       let rpc = new ReadOnlyRpc(p.url,new HttpClient(0,fetch,0,5000),10,true);
+      const call=(method:string,params:unknown[])=>{
+        probeRequests++;probeCalls++;
+        return rpc.call(method,params);
+      };
       try {
         let identity: unknown;
-        try { identity = this.chain === "solana" ? await rpc.call("getGenesisHash",[]) : await rpc.call("eth_chainId",[]); }
+        try { identity = this.chain === "solana" ? await call("getGenesisHash",[]) : await call("eth_chainId",[]); }
         catch { rpc = new ReadOnlyRpc(p.url,new HttpClient(0,fetch,0,5000),1,false);
-          identity = this.chain === "solana" ? await rpc.call("getGenesisHash",[]) : await rpc.call("eth_chainId",[]);
+          identity = this.chain === "solana" ? await call("getGenesisHash",[]) : await call("eth_chainId",[]);
           p.row.supportsBatching = false; }
         if (identity !== (this.chain === "solana" ? "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d" : this.chain === "base" ? "0x2105" : "0x38"))
           throw new Error("Wrong RPC chain");
         try {
+          probeRequests++;probeCalls+=2;
           await new ReadOnlyRpc(p.url,new HttpClient(0,fetch,0,5000),10,true).batch(this.chain === "solana" ? [{method:"getGenesisHash",params:[]},{method:"getGenesisHash",params:[]}]
             : [{method:"eth_chainId",params:[]},{method:"eth_chainId",params:[]}]);
           p.row.supportsBatching = true;
         } catch { p.row.supportsBatching = false; rpc = new ReadOnlyRpc(p.url,new HttpClient(0,fetch,0,5000),1,false); }
         if (this.chain !== "solana") {
-          const head = blockSchema.parse(await rpc.call("eth_getBlockByNumber",["latest",false]));
+          const head = blockSchema.parse(await call("eth_getBlockByNumber",["latest",false]));
           const n = Number(BigInt(head.number));
           const old = `0x${Math.max(1,n-50000).toString(16)}`;
-          try { p.row.supportsArchive = !!blockSchema.safeParse(await rpc.call("eth_getBlockByNumber",[old,false])).success; }
+          try { p.row.supportsArchive = !!blockSchema.safeParse(await call("eth_getBlockByNumber",[old,false])).success; }
           catch { p.row.supportsArchive = false; }
-          try { p.row.supportsGetLogs = Array.isArray(await rpc.call("eth_getLogs",[{fromBlock:`0x${Math.max(1,n-100).toString(16)}`,toBlock:`0x${Math.max(1,n-99).toString(16)}`,address:"0x0000000000000000000000000000000000000001"}])); }
+          try { p.row.supportsGetLogs = Array.isArray(await call("eth_getLogs",[{fromBlock:`0x${Math.max(1,n-100).toString(16)}`,toBlock:`0x${Math.max(1,n-99).toString(16)}`,address:"0x0000000000000000000000000000000000000001"}])); }
           catch { p.row.supportsGetLogs = false; }
           const token = this.chain === "base" ? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" : "0x55d398326f99059fF775485246999027B3197955";
-          try { p.row.supportsHistoricalState = typeof await rpc.call("eth_call",[{to:token,data:"0x313ce567"},old]) === "string"; }
+          try { p.row.supportsHistoricalState = typeof await call("eth_call",[{to:token,data:"0x313ce567"},old]) === "string"; }
           catch { p.row.supportsHistoricalState = false; }
-          try { p.row.supportsMulticall = typeof await rpc.call("eth_call",[{to:"0xca11bde05977b3631167028862be2a173976ca11",data:multicall.encodeFunctionData("aggregate3",[[]])},"latest"]) === "string"; }
+          try { p.row.supportsMulticall = typeof await call("eth_call",[{to:"0xca11bde05977b3631167028862be2a173976ca11",data:multicall.encodeFunctionData("aggregate3",[[]])},"latest"]) === "string"; }
           catch { p.row.supportsMulticall = false; }
         }
         this.record(p.row,true,0);
       } catch (error) { this.record(p.row,false,0,error instanceof Error ? error.message : "probe failed"); }
       p.row.lastProbeAt = Date.now();
-      if (rpc.requests) this.store.recordRpcRequest(p.row.providerId,minute(),rpc.requests,0,0,0,rpc.requests);
+      // Refund the unused reservation in the original minute, retaining actual failed requests.
+      this.store.recordRpcRequest(p.row.providerId,probeMinute,probeCalls-8,0,0,0,probeRequests-8);
       this.store.saveRpcProvider(p.row);
     }));
   }

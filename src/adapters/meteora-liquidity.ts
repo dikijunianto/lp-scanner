@@ -52,6 +52,13 @@ export function mintDecimals(account: Account) {
     throw new Error("Invalid mint account");
   return data[44];
 }
+// SPL Token account amount is a little-endian u64 at byte 64, including Token-2022 extensions.
+export function vaultAmount(account:Account,mint:string,decimals:number) {
+  const data=bytes(account);
+  if(!account || !mintOwners.includes(account.owner) || data.length<165 || data[108]!==1 ||
+    new PublicKey(data.subarray(0,32)).toBase58()!==mint)throw new Error('Invalid token vault');
+  return tokenUnits(data.readBigUInt64LE(64).toString(),decimals).toNumber();
+}
 export function decodePair(account: Account) {
   return decodeAccount<LbPair>(program, "lbPair", bytes(account, PROGRAM.toBase58()));
 }
@@ -74,8 +81,8 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
     const genesis = await rpc.call("getGenesisHash", []);
     if (genesis !== "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d")
       throw new Error("Wrong Solana cluster");
-    for (let start = 0; start < targets.length; start += 20) {
-      const chunk = targets.slice(start, start + 20);
+    for (let start = 0; start < targets.length; start += 16) {
+      const chunk = targets.slice(start, start + 16);
       try {
         const first = accountsSchema.parse(
           await rpc.call("getMultipleAccounts", [
@@ -91,6 +98,7 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
               const binIndex = binIdToBinArrayIndex(new BN(pair.activeId));
               return {
                 pool,
+                pair,
                 binIndex,
                 binAddress: deriveBinArray(
                   new PublicKey(pool.poolAddress),
@@ -111,6 +119,7 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
             prepared.flatMap((p) => [
               p.pool.poolAddress,
               p.binAddress,
+              p.pair.reserveX.toBase58(),p.pair.reserveY.toBase58(),
               ...[p.mint0, p.mint1].filter(
                 (mint) => (mintCache.get(mint)?.until ?? 0) <= Date.now(),
               ),
@@ -192,6 +201,9 @@ export async function enrichMeteoraLiquidity(pools: Pool[], rpc: ReadOnlyRpc, no
               pairPrice: numericPairPrice, sourceTimestamp: blockTime, observedAt,
               blockNumber: String(batch.context.slot), token0Address: pair.tokenXMint.toBase58(),
               token1Address: pair.tokenYMint.toBase58(),
+              depositedToken0Amount:(()=>{try{return vaultAmount(accounts.get(pair.reserveX.toBase58())??null,pair.tokenXMint.toBase58(),d0)}catch{return undefined}})(),
+              depositedToken1Amount:(()=>{try{return vaultAmount(accounts.get(pair.reserveY.toBase58())??null,pair.tokenYMint.toBase58(),d1)}catch{return undefined}})(),
+              execution:{kind:'DLMM_BIN',amount0:amount0.toNumber(),amount1:amount1.toNumber()},
               depositedLiquidityUsd: Number.isFinite(lowerBound) && lowerBound > 0 ? lowerBound : 0,
               liquiditySourceTimestamp: Math.min(blockTime, reference0 ?? blockTime, reference1 ?? blockTime),
               source: "Solana confirmed RPC active-bin deposits",

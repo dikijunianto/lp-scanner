@@ -1,13 +1,26 @@
-import { statfsSync } from "node:fs";
+import {createEpochStore} from "./epochs";
+import { existsSync, statfsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type Database from "better-sqlite3";
 import { env } from "../config/env";
 import type { Pool,Snapshot } from "../core/model";
 import type { ScanSpan } from "../core/traffic";
 import {sampleTrace} from "../core/clock";
+import {activeCursorState,lagDistribution} from "../core/epoch";
 import {staleCursorReason} from "../core/live-health";
 
 const minute = 60_000;
+export function liveFeeFailure(input:{complete:boolean;covered:boolean;currentWindow:boolean;
+  fresh:boolean;error:string|null;continuityState?:string;unpriced:number;swaps:number}) {
+  if(input.complete && input.covered && input.currentWindow)return null;
+  if(/reorg|block changed|block mismatch|removed log/i.test(input.error??"") || input.continuityState==='REORG_PENDING')return 'REORG_PENDING';
+  if(input.error && !input.fresh)return 'PROVIDER_FAILURE';
+  if(/source|indexer/i.test(input.error??""))return 'SOURCE_GAP';
+  if(!input.currentWindow)return 'WINDOW_NOT_MATURE';
+  if(!input.covered)return 'CURSOR_GAP';
+  if(input.unpriced>0)return 'UNPRICED_SWAPS';
+  return input.swaps===0?'NO_EVENTS':'OTHER';
+}
 export function diskMode(freeBytes:number) {
   const gib=2**30;
   return freeBytes<env.DISK_EMERGENCY_GIB*gib?"EMERGENCY":
@@ -26,14 +39,67 @@ export interface CoreSnapshotRow {
   activity:number|null;risk:number|null;volume1h:number|null;fees1h:number|null;
   activeLiquidityUsd:number|null;depth5Usd:number|null;volatility1h:number|null;
 }
+export interface WalStatus {
+  attemptedAt:number;durationMs:number;walBeforeBytes:number;walAfterBytes:number;
+  result:{busy:number;logFrames:number;checkpointedFrames:number}|null;
+  remainingFrames:number|null;blockedOrPending:boolean;error:string|null;
+  ownedReaderAgeMs:number|null;ownedReaderCount:number;
+  readerCoverage:"EXPLICIT_OWNED_SCOPES_ONLY";globalReaderAgeMs:null;globalReaderStatus:"UNKNOWN";
+}
 export function createContinuityStore(sqlite:Database.Database,databasePath:string) {
+  const readers=new Map<symbol,{operation:string;startedAt:number}>();
+  const walBytes=()=>databasePath!==":memory:" && existsSync(`${resolve(databasePath)}-wal`)?
+    statSync(`${resolve(databasePath)}-wal`).size:0;
+  const walStatus=():WalStatus|null=>{
+    const row=sqlite.prepare("SELECT value FROM app_settings WHERE key='walMaintenanceStatus'").get() as {value:string}|undefined;
+    return row?JSON.parse(row.value) as WalStatus:null;
+  };
   return {
+    // Only explicitly instrumented scopes are observable; SQLite does not expose global reader ages.
+    beginOwnedRead(operation:string,startedAt=Date.now()) {
+      const id=Symbol(operation);readers.set(id,{operation,startedAt});
+      return ()=>{readers.delete(id);};
+    },
+    ownedReaderStatus(now=Date.now()) {
+      return {count:readers.size,oldestAgeMs:readers.size?
+        Math.max(0,...Array.from(readers.values(),r=>now-r.startedAt)):null,
+      coverage:"EXPLICIT_OWNED_SCOPES_ONLY" as const,globalReaderAgeMs:null};
+    },
+    walStatus,
+    walMaintenance(now=Date.now()):WalStatus|null {
+      if(databasePath===":memory:") return null;
+      // Persist the throttle across worker restarts and claim it before checkpointing.
+      const claimed=sqlite.transaction(()=>{
+        const last=sqlite.prepare("SELECT value FROM app_settings WHERE key='walMaintenanceAttempt'").get() as {value:string}|undefined;
+        if(last && now-Number(last.value)>=0 && now-Number(last.value)<60000) return false;
+        sqlite.prepare("INSERT OR REPLACE INTO app_settings VALUES ('walMaintenanceAttempt',?)").run(String(now));
+        return true;
+      })();
+      if(!claimed) return walStatus();
+      const status:WalStatus={attemptedAt:now,durationMs:0,walBeforeBytes:walBytes(),walAfterBytes:0,
+        result:null,remainingFrames:null,blockedOrPending:false,error:null,
+        ownedReaderAgeMs:readers.size?Math.max(0,...Array.from(readers.values(),r=>now-r.startedAt)):null,
+        ownedReaderCount:readers.size,readerCoverage:"EXPLICIT_OWNED_SCOPES_ONLY",
+        globalReaderAgeMs:null,globalReaderStatus:"UNKNOWN"};
+      const start=performance.now();
+      try {
+        const result=(sqlite.pragma("wal_checkpoint(PASSIVE)") as {busy:number;log:number;checkpointed:number}[])[0];
+        status.result={busy:result.busy,logFrames:result.log,checkpointedFrames:result.checkpointed};
+        status.remainingFrames=result.log<0 || result.checkpointed<0?null:Math.max(0,result.log-result.checkpointed);
+        // Pending frames can have several causes; this is not proof of a blocking reader.
+        status.blockedOrPending=result.busy!==0 || (status.remainingFrames??0)>0;
+      } catch(error) {status.error=error instanceof Error?error.message:String(error);}
+      status.durationMs=Math.max(0,performance.now()-start);status.walAfterBytes=walBytes();
+      sqlite.prepare("INSERT OR REPLACE INTO app_settings VALUES ('walMaintenanceStatus',?)").run(JSON.stringify(status));
+      return status;
+    },
     burninContext() {
       const row=sqlite.prepare("SELECT value FROM app_settings WHERE key='burninContext'").get() as {value:string}|undefined;
       return row?JSON.parse(row.value) as {startedAt:number;finishedAt?:number;id:string}:null;
     },
     hourlyCheckpoints() {
-      const id=sqlite.prepare("SELECT burnin_id id FROM hourly_slo_checkpoints ORDER BY observed_at DESC LIMIT 1").get() as {id:string}|undefined;
+      const context=this.burninContext();
+      const id=context?{id:context.id}:sqlite.prepare("SELECT burnin_id id FROM hourly_slo_checkpoints ORDER BY observed_at DESC LIMIT 1").get() as {id:string}|undefined;
       return id?sqlite.prepare("SELECT data FROM hourly_slo_checkpoints WHERE burnin_id=? ORDER BY hour").all(id.id).map(r=>{const slo=JSON.parse((r as {data:string}).data);delete slo.data;delete slo.storage;delete slo.scans;return slo;}):[];
     },
     scanWindow(from:number,to=Date.now()) {
@@ -187,8 +253,9 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
     writeCoreSnapshots(now=Date.now()) {
       const at=Math.floor(now/minute)*minute;
       const freshAfter=at-5*minute;
+      const trackedWhere=`(${hotWhere} OR EXISTS (SELECT 1 FROM signal_outcomes o JOIN signal_episodes s ON s.id=o.signal_id JOIN research_epochs e ON e.id=s.research_epoch_id WHERE s.pool_id=p.id AND e.status='ACTIVE' AND o.due_at>=${at}))`;
       return sqlite.transaction(()=>{
-        const ids=(sqlite.prepare(`SELECT p.id FROM pools p WHERE ${hotWhere}`)
+        const ids=(sqlite.prepare(`SELECT p.id FROM pools p WHERE ${trackedWhere}`)
           .all(env.PRIORITY_TIER1_VOLUME_1H) as {id:string}[]).map((r)=>r.id);
         const target=new Set(ids);
         const open=sqlite.prepare("SELECT pool_id poolId FROM core_tracking_intervals WHERE ended_at IS NULL")
@@ -216,7 +283,7 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
             THEN json_extract(p.data,'$.pool.depth5PctUsd') END,
           CASE WHEN p.updated_at>=? THEN json_extract(p.data,'$.pool.realizedVolatility1h') END,
           'sprint8-core-v2'
-        FROM pools p WHERE ${hotWhere}`).run(at,...Array(9).fill(freshAfter),env.PRIORITY_TIER1_VOLUME_1H).changes;
+        FROM pools p WHERE ${trackedWhere}`).run(at,...Array(9).fill(freshAfter),env.PRIORITY_TIER1_VOLUME_1H).changes;
       }).immediate();
     },
     coreHistory(poolId:string,from:number,to:number):CoreSnapshotRow[] {
@@ -272,14 +339,34 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
         feeCoveragePct:expected?fees/expected*100:null,depthCoveragePct:expected?depth/expected*100:null,
         largestGapMs:pools.length?Math.max(...pools.map((p)=>p.largestGapMs??0)):null,pools};
     },
+    liveCoverageComplete(poolId:string,start:number,end:number) {
+      const intervals=sqlite.prepare('SELECT start_time start,end_time end FROM live_coverage_intervals WHERE pool_id=? AND valid=1 AND end_time>=? AND start_time<=? ORDER BY start_time')
+        .all(poolId,start,end) as {start:number;end:number}[];
+      let cursor=start;
+      for(const i of intervals){if(i.end<cursor)continue;if(i.start>cursor)break;cursor=Math.max(cursor,i.end);}
+      const gap=sqlite.prepare('SELECT 1 FROM fee_gaps WHERE pool_id=? AND resolved_at IS NULL AND from_time<? AND to_time>? LIMIT 1').get(poolId,end,start);
+      return end>start && cursor>=end && !gap;
+    },
+    hotLagDistributions(now=Date.now()) {
+      const all=this.hotPoolDetails(now).filter(r=>r.chain==='base');
+      return {allHot:lagDistribution(all),hotActive:lagDistribution(all.filter(r=>r.activity!=='NO_ACTIVITY')),
+        noActivity:lagDistribution(all.filter(r=>r.activity==='NO_ACTIVITY'))};
+    },
+    feeWaterfall(now=Date.now()) {
+      const all=this.hotPoolDetails(now).filter(r=>r.chain==='base'),active=all.filter(r=>r.activity!=='NO_ACTIVITY');
+      return {allHot:all.length,active:active.length,eventComplete:active.filter(r=>r.eventCovered && r.currentWindow).length,
+        swapPricesComplete:active.filter(r=>r.eventCovered && r.currentWindow && r.unpricedSwaps===0).length,
+        feeComplete:active.filter(r=>r.feeComplete).length,failures:active.filter(r=>!r.feeComplete).map(r=>({poolId:r.poolId,reason:r.feeFailure,unpricedSwaps:r.unpricedSwaps}))};
+    },
     hotPoolDetails(now=Date.now()) {
-      const rows=sqlite.prepare(`SELECT p.id,p.chain,p.data,l.end_time cursorTime,l.head_time headTime,
+      const rows=sqlite.prepare(`SELECT p.id,p.chain,p.data,EXISTS(SELECT 1 FROM signal_episodes s WHERE s.pool_id=p.id AND s.episode_end IS NULL) signalActive,l.end_time cursorTime,l.head_time headTime,
         l.updated_at cursorUpdatedAt,h.reason,h.last_error error,
         (SELECT MAX(timestamp) FROM fee_events e WHERE e.pool_id=p.id) lastSwapTimestamp,
         (SELECT MAX(block_number) FROM fee_events e WHERE e.pool_id=p.id) lastSwapBlock,
+        (SELECT reason FROM depth_failures d WHERE d.pool_id=p.id AND d.last_at>=? ORDER BY last_at DESC LIMIT 1) depthReason,
         (SELECT f.data FROM fee_windows f WHERE f.pool_id=p.id AND f.window_name='1h' ORDER BY window_end DESC LIMIT 1) fee
         FROM pools p LEFT JOIN live_fee_cursors l ON l.pool_id=p.id LEFT JOIN live_pool_health h ON h.pool_id=p.id
-        WHERE ${hotWhere}`).all(env.PRIORITY_TIER1_VOLUME_1H) as Record<string,unknown>[];
+        WHERE ${hotWhere}`).all(now-300000,env.PRIORITY_TIER1_VOLUME_1H) as Record<string,unknown>[];
       return rows.map(row=>{
         const data=JSON.parse(String(row.data)) as Snapshot,p=data.pool;
         const fee=row.fee?JSON.parse(String(row.fee)):null;
@@ -294,13 +381,27 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
           ['HIGH','MEDIUM'].includes(p.depthConfidence??'') && (p.depthPriceDriftPct??Infinity)<=env.DEPTH_PRICE_DRIFT_PCT;
         const lag=row.cursorTime==null?null:Math.max(0,(now-Number(row.cursorTime))/1000);
         const fresh=lag!==null && lag<=120 && row.headTime!=null && now-Number(row.headTime)<=180000 && Number(row.headTime)<=now+30000;
-        const activity=complete && fee.activityState==='NO_ACTIVITY'?'NO_ACTIVITY':'ACTIVE_OR_MISSING';
+        const covered=!!fee && this.liveCoverageComplete(p.id,fee.windowStart,fee.windowEnd);
+        const activity=complete && covered && fee.activityState==='NO_ACTIVITY'?'NO_ACTIVITY':'ACTIVE_OR_MISSING';
+        const cursorState=activeCursorState({fresh,lagSeconds:lag,provenZero:activity==='NO_ACTIVITY',ingestionCovered:covered,
+          recentSwaps:fee?.swapCount??null,error:row.error==null?null:String(row.error)});
+        const currentWindow=fee?.windowEnd>=now-300000 && fee?.windowEnd<=now+30000;
+        const recent=sqlite.prepare(`SELECT COUNT(*) swaps,SUM(volume_usd IS NULL OR COALESCE(lp_fee_usd,fees_usd) IS NULL) unpriced
+          FROM fee_events WHERE pool_id=? AND timestamp>=? AND timestamp<?`).get(p.id,
+            currentWindow?fee.windowStart:Math.floor(now/60000)*60000-3600000,
+            currentWindow?fee.windowEnd:Math.floor(now/60000)*60000) as {swaps:number;unpriced:number|null};
+        const feeFailure=liveFeeFailure({complete,covered,currentWindow,fresh,
+          error:row.error==null?null:String(row.error),continuityState:fee?.continuityState,
+          unpriced:recent.unpriced??0,swaps:recent.swaps});
         const reason=staleCursorReason({fresh,lagSeconds:lag,headAgeSeconds:row.headTime==null?null:(now-Number(row.headTime))/1000,
           updatedAgeSeconds:row.cursorUpdatedAt==null?null:(now-Number(row.cursorUpdatedAt))/1000,
           error:row.error==null?null:String(row.error),covered:complete,swaps:fee?.swapCount??null});
         const failures=[p.token0,p.token1].map(token=>({address:token.address,symbol:token.symbol,
-          reliable:reliable(token),provenance:token.priceProvenance??null,failures:(token.priceFailures??[]).map(f=>({MISSING:"NO_SUPPORTED_PRICE_SOURCE",RATE_LIMITED:"SOURCE_RATE_LIMIT",TIMEOUT:"SOURCE_TIMEOUT",STALE:"STALE",DISAGREEMENT:"PRICE_DISAGREEMENT"} as Record<string,string>)[f.reason]??"UNKNOWN")}));
-        return {poolId:p.id,chain:p.chain,priced,depth,feeComplete:complete,activity,fresh,lagSeconds:lag,reason,
+          reliable:reliable(token),provenance:token.priceProvenance??null,failures:(token.priceFailures??[]).map(f=>({MISSING:"NO_SOURCE",NO_RELIABLE_SOURCE:"NO_SOURCE",INVALID_RESPONSE:"MAPPING_ERROR",FUTURE_TIMESTAMP:"TIMESTAMP_MISMATCH",HTTP_ERROR:"OTHER",RATE_LIMITED:"SOURCE_RATE_LIMIT",TIMEOUT:"SOURCE_TIMEOUT",STALE:"STALE",DISAGREEMENT:"PRICE_DISAGREEMENT"} as Record<string,string>)[f.reason]??"OTHER")}));
+        return {poolId:p.id,chain:p.chain,signalActive:!!row.signalActive,priced,depth,feeComplete:complete && covered,activity,fresh,lagSeconds:lag,reason,
+          cursorState,eventCovered:covered,currentWindow,unpricedSwaps:recent.unpriced??0,feeFailure,
+          zeroActivityState:activity==='NO_ACTIVITY'?'COMPLETE_ZERO_ACTIVITY':null,
+          depthFailure:depth?null:!priced?'UNPRICED':row.depthReason?({TICK_READ_LIMIT:'TICK_DATA_MISSING',NO_TICKS:'TICK_DATA_MISSING',STALE_PRICE:'PRICE_DRIFT',RPC_UNSUPPORTED:'PROVIDER_FAILURE',POOL_STATE_FAILURE:'STATE_READ_FAILURE',INDEXER_STALE:'CACHE_STALE',PROVIDER_FAILURE:'PROVIDER_FAILURE'} as Record<string,string>)[String(row.depthReason)]??'RECONSTRUCTION_ERROR':(p.depthState==='STALE'?'CACHE_STALE':'QUEUE_DELAY'),
           lastSwapTimestamp:row.lastSwapTimestamp,lastSwapBlock:row.lastSwapBlock,priceTokens:failures};
       });
     },
@@ -312,6 +413,7 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
           depth5:pools.filter(r=>r.depth).length,depth5Priced:pools.filter(r=>r.depth && r.priced).length,
           fee1h:pools.filter(r=>r.feeComplete).length,activePools:active.length,
           activeFee1h:active.filter(r=>r.feeComplete).length,activeFresh:active.filter(r=>r.fresh).length,
+          signalPools:pools.filter(r=>r.signalActive).length,signalPriced:pools.filter(r=>r.signalActive&&r.priced).length,activePriced:active.filter(r=>r.priced).length,
           noActivity:pools.length-active.length};
       });
     },
@@ -336,6 +438,7 @@ export function createContinuityStore(sqlite:Database.Database,databasePath:stri
         p95Ms:a.length?a[Math.floor((a.length-1)*.95)]:null};
     },
     newOutcomeLag(now=Date.now()) {
+      const epochs=createEpochStore(sqlite);if(epochs.researchEpoch())return {...epochs.epochOutcomeLag(now),legacyCount:0};
       const row=sqlite.prepare("SELECT valid_from at FROM dataset_versions WHERE version='sprint9-v3'")
         .get() as {at:number}|undefined;
       if(!row) return {n:0,p95Ms:null,legacyCount:0};

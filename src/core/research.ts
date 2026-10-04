@@ -107,6 +107,8 @@ export interface RangeOutcome {
   timeSpentInRangePct: number | null;
 }
 export interface Outcome {
+  sampleDensityPct?:number;
+  largestPriceGapMs?:number;
   endpointAt: number | null;
   priceAtSignal?: number | null;
   priceAtHorizon?: number | null;
@@ -151,6 +153,7 @@ export function evaluateOutcome(
   horizon: Horizon,
   policy: SignalPolicy,
   generated: { fees: number | null; volume: number | null } = { fees: null, volume: null },
+  density?:{minimumDensityPct:number;maxGapMs:number},
 ): Outcome {
   const start = signal.pool.timestamp;
   const due = start + horizons[horizon];
@@ -159,7 +162,7 @@ export function evaluateOutcome(
       (s) =>
         s.pool.timestamp > start &&
         s.pool.timestamp <= due + policy.maxObservationGapMs &&
-        s.pool.id === signal.pool.id && valid(s.pool.price) && s.pool.price > 0,
+        s.pool.id === signal.pool.id && (!density || ['HIGH','MEDIUM'].includes(s.metrics.priceConfidence??'UNAVAILABLE')) && valid(s.pool.price) && s.pool.price > 0,
     )
     .sort((a, b) => a.pool.timestamp - b.pool.timestamp);
   const endpoint = observations.find((s) => s.pool.timestamp >= due) ?? null;
@@ -176,7 +179,12 @@ export function evaluateOutcome(
       0,
     );
   const coverage = Math.min(100, (coveredMs / horizons[horizon]) * 100);
-  const enough = endpoint !== null && coverage >= 80;
+  const minuteBins=new Set(observations.filter(s=>s.pool.timestamp<=due).map(s=>Math.floor(s.pool.timestamp/60000)));
+  const sampleDensityPct=Math.min(100,minuteBins.size/Math.ceil(horizons[horizon]/60000)*100);
+  const largestPriceGapMs=Math.max(0,...path.slice(1).map((s,i)=>s.pool.timestamp-path[i].pool.timestamp));
+  const signalReliable=['HIGH','MEDIUM'].includes(signal.metrics.priceConfidence??"UNAVAILABLE");
+  const enough = endpoint !== null && coverage >= 80 && (!density ||
+    (signalReliable && sampleDensityPct>=density.minimumDensityPct && largestPriceGapMs<=density.maxGapMs));
   const startPrice = signal.pool.price;
   const priceMoves = path.map((s) => change(startPrice, s.pool.price)).filter(valid);
   const vols = path.map((s) => s.pool.realizedVolatility1h).filter(valid);
@@ -264,6 +272,8 @@ export function evaluateOutcome(
     result.activeLiquidityChange,result.depth5PctChange,result.activityPersistence,
     result.ranges["2.5"].remainedInRange,result.ranges["5"].remainedInRange,
     result.ranges["10"].remainedInRange].filter((v)=>v!==null).length;
+  result.sampleDensityPct=sampleDensityPct;
+  result.largestPriceGapMs=largestPriceGapMs;
   result.outcomeCompletenessPct=complete*10;
   const group=(values:(unknown|null|undefined)[],sufficient:boolean)=>sufficient?"COMPLETE" as const:
     values.some((v)=>v!==null && v!==undefined)?"PARTIAL" as const:"UNAVAILABLE" as const;

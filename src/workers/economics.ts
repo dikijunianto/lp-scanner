@@ -1,9 +1,9 @@
 import { env,priorityPolicy } from "../config/env";
-import { priorityScore } from "../core/research";
+import { priorityScore,priorityTier } from "../core/research";
 import { snapshot } from "../core/analytics";
 import type { Store } from "../db/store";
 import { enrichPrices, pricePolicy } from "../adapters/pricing";
-import { applyPrice, deriveCrossAssetPrices, priceLineage, type EvidencedPrice, type CrossAssetPricePolicy, type PriceProvenance } from "../core/pricing";
+import { applyPrice, derivePriceGraph, priceLineage, type EvidencedPrice, type CrossAssetPricePolicy, type PriceProvenance } from "../core/pricing";
 import type { Token } from "../core/model";
 import type { PriceFailure } from "../adapters/pricing";
 type PriceToken=Token & {priceProvenance?:PriceProvenance|null;priceFailures?:PriceFailure[]};
@@ -28,9 +28,16 @@ export class EconomicWorker {
     const watched=this.store.watchedIds();
     const active=this.store.activeSignalIds();
     const prioritized=(id:string)=>watched.has(id)||active.has(id);
-    snapshots.sort((a,b)=>priorityScore(b.pool,prioritized(b.pool.id),b.metrics,priorityPolicy())-
+    const hot=(s:typeof snapshots[number])=>prioritized(s.pool.id)||priorityTier(s.pool,false,s.metrics,priorityPolicy())===1;
+    const freshAt=(s:typeof snapshots[number])=>Math.min(s.pool.token0.usdPriceObservedAt??0,s.pool.token1.usdPriceObservedAt??0);
+    const rank=(s:typeof snapshots[number])=>hot(s)?(prioritized(s.pool.id)?0:1):priorityTier(s.pool,false,s.metrics,priorityPolicy())===2?2:3;
+    snapshots.sort((a,b)=>rank(a)-rank(b) || freshAt(a)-freshAt(b) || priorityScore(b.pool,prioritized(b.pool.id),b.metrics,priorityPolicy())-
       priorityScore(a.pool,prioritized(a.pool.id),a.metrics,priorityPolicy()));
-    const pools=snapshots.map((s)=>s.pool);
+    const hotTargets=snapshots.filter(s=>hot(s) && ['solana','base'].includes(s.pool.chain));
+    const reserved=hotTargets.slice(0,Math.min(env.PRICE_POOL_LIMIT,env.PRICE_HOT_RESERVED_POOLS));
+    // HOT work completes before cold work. Refresh all HOT first, rotating oldest observations.
+    const pools=(reserved.length?reserved:snapshots.filter(s=>!hot(s) && ['solana','base'].includes(s.pool.chain)).slice(0,20)).map(s=>s.pool);
+    const previouslyPriced=new Set(snapshots.filter(s=>['HIGH','MEDIUM'].includes(s.metrics.priceConfidence??'')).map(s=>s.pool.id));
     const original=new Map(pools.map((p)=>[p.id,p.timestamp]));
     const changed=new Set(pools.slice(0,env.PRICE_POOL_LIMIT).map((p)=>p.id));
     const derivationPolicy:CrossAssetPricePolicy={
@@ -38,14 +45,15 @@ export class EconomicWorker {
       maxAgeMs:env.ACTIVE_LIQUIDITY_MAX_AGE_SECONDS*1000,
       maxAlignmentMs:env.CROSS_PRICE_MAX_ALIGNMENT_SECONDS*1000,
       maxPools:env.PRICE_POOL_LIMIT,
-      maxDerivations:2,
+      maxDerivations:2,maxHops:env.CROSS_PRICE_MAX_HOPS,
+      notionalUsd:env.CROSS_PRICE_NOTIONAL_USD,maxPriceImpact:env.CROSS_PRICE_MAX_IMPACT,
     };
     const priced=await enrichPrices(pools,this.store,{derivationPolicy});
     this.store.savePrices(priced.records);
     if(env.ACTIVE_LIQUIDITY_ENABLED)
     for(const chain of ["base","solana"]) {
       const limit=chain==="solana"?env.ACTIVE_LIQUIDITY_METEORA_LIMIT:env.ACTIVE_LIQUIDITY_EVM_LIMIT;
-      const targets=pools.filter((p)=>p.chain===chain).slice(0,limit);
+      const targets=pools.filter((p)=>p.chain===chain).sort((a,b)=>(a.pairState?.sourceTimestamp??0)-(b.pairState?.sourceTimestamp??0)).slice(0,limit);
       if(!targets.length) continue;
       await enrichLiquidity(targets,this.store);
       for(const pool of targets) changed.add(pool.id);
@@ -64,7 +72,7 @@ export class EconomicWorker {
     for(const pool of priceTargets) for(const token of [pool.token0,pool.token1]) {
       if(["HIGH","MEDIUM"].includes(token.usdPriceConfidence ?? "UNAVAILABLE") ||
          (token as PriceToken).priceFailures?.some((failure)=>failure.reason==="DISAGREEMENT")) continue;
-      const record=deriveCrossAssetPrices(pool,token,pools,references,Date.now(),{...derivationPolicy,maxDerivations:1})[0];
+      const record=derivePriceGraph(pool,token,pools,references,Date.now(),{...derivationPolicy,maxDerivations:1})[0];
       if(!record) continue;
       applyPrice(token,record,pool,pricePolicy());
       token.priceSourceCount=priceLineage(record).length;
@@ -80,6 +88,8 @@ export class EconomicWorker {
       const updated=snapshot(pool,this.store.analyticsHistory(pool.id,pool.timestamp).map((s)=>s.pool),
         this.store.candles(pool.id));
       this.store.replaceCurrent(updated);
+      if(hotTargets.some(s=>s.pool.id===pool.id) && ['HIGH','MEDIUM'].includes(updated.metrics.priceConfidence??'') &&
+        (!previouslyPriced.has(pool.id) || pool.depthState!=='CURRENT'))this.store.enqueueDepth(pool.id,'RELIABLE_PRICE_AVAILABLE');
     }
   }
   start() {

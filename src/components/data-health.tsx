@@ -1,6 +1,13 @@
 "use client";
 import Link from "next/link";
 import { useData } from "./use-data";
+import type { ResearchEpoch, ServiceHealth } from "../core/epoch";
+
+type OutcomeCoverage = {horizon:string;eligible:number;priceRangeComplete:number;partial:number;missing:number};
+type Lag = {total:number;known:number;unknown:number;median:number|null;p90:number|null;p95:number|null;max:number|null};
+type PriceSourceCoverage = {chain:string;asset_address:string;source:string;kind:string|null;
+  last_success:number|null;last_failure:number|null;failure_reason:string|null;coverage_resolution:string|null;
+  publication_latency_ms:number|null;confidence:string|null};
 
 type Provider = {providerId:string;chain:string;providerType:string;supportsArchive:boolean|null;
   supportsGetLogs:boolean|null;supportsBatching:boolean|null;supportsMulticall:boolean|null;
@@ -8,12 +15,17 @@ type Provider = {providerId:string;chain:string;providerType:string;supportsArch
   errorRate:number;lastSuccessAt:number|null;lastFailureAt:number|null};
 type Row = Record<string, string | number | null>;
 type Health = {summaryAgeMs:number;summaryStale:boolean;
-  hotPoolDetails:{poolId:string;chain:string;priced:boolean;depth:boolean;feeComplete:boolean;activity:string;fresh:boolean;lagSeconds:number|null;reason:string;priceTokens:{address:string;symbol:string;reliable:boolean;failures:string[];provenance:unknown}[]}[];
+  researchEpoch?:ResearchEpoch|null;burninRunId?:string|null;providerServices?:ServiceHealth[];
+  currentEpochOutcomes?:OutcomeCoverage[];allHistoryOutcomes?:OutcomeCoverage[];
+  baseLag?:{allHot:Lag;hotActive:Lag;noActivity:Lag};
+  baseFeeWaterfall?:{allHot:number;active:number;eventComplete:number;swapPricesComplete:number;feeComplete:number;
+    failures:{poolId:string;reason:string|null;unpricedSwaps:number}[]};priceSourceCoverage?:PriceSourceCoverage[];
+  hotPoolDetails:{poolId:string;chain:string;priced:boolean;depth:boolean;feeComplete:boolean;activity:string;signalActive?:boolean;fresh:boolean;lagSeconds:number|null;reason:string;cursorState?:string;feeFailure?:string|null;depthFailure?:string|null;priceTokens:{address:string;symbol:string;reliable:boolean;failures:string[];provenance:{kind:string}|null}[]}[];
   generatedAt:number;providers:Provider[];usage:Row[];priceCalls:Row[];coverage:Row[];currentFees:Row[];
   bscSource:{liveLogs:boolean;historicalLogs:boolean;archiveState:boolean;websocket:string};
-  readiness:{status:string;selectedChains:string[];failed:string[];gates:{id:string;value:number|null;target:number;pass:boolean}[];
+  readiness:{status:string;selectedChains:string[];failed:string[];gates:{id:string;value:number|null;target:number;pass:boolean;hourlyCompliance?:number}[];
     bsc:{status:string;failed:string[]}};
-  hotCoverage:{chain:string;pools:number;priced:number;depth5:number;fee1h:number;activePools:number;activeFee1h:number;activeFresh:number}[];
+  hotCoverage:{chain:string;pools:number;priced:number;depth5:number;depth5Priced?:number;fee1h:number;activePools:number;activePriced?:number;signalPools?:number;signalPriced?:number;activeFee1h:number;activeFresh:number}[];
   snapshotCoverage:{tracked:number;maturePools:number;expected:number;actual:number;priced:number;
     fees:number;depth:number;coveragePct:number|null;priceCoveragePct:number|null;
     feeCoveragePct:number|null;depthCoveragePct:number|null;largestGapMs:number|null};
@@ -54,8 +66,24 @@ type Health = {summaryAgeMs:number;summaryStale:boolean;
     databaseBytesDelta:number|null};};
 const yes = (v:boolean|null) => v === null ? "Unknown" : v ? "Yes" : "No";
 const age = (v:number|null, now:number) => v == null ? "Unknown" : `${Math.round((now-v)/60000)} min ago`;
+const ratio = (n:number,total:number) => `${n}/${total}${total?` (${(n/total*100).toFixed(1)}%)`:" — no eligible data"}`;
+const seconds = (n:number|null) => n===null?"Unavailable":`${n.toFixed(1)}s`;
 export function DataHealthPage() {
   const {data,error} = useData<Health>("/api/diagnostics/data-health",30000);
+  const selectedHot=(data?.hotPoolDetails??[]).filter(r=>['base','solana'].includes(r.chain));
+  const hotTokenKeys=new Set(selectedHot.flatMap(r=>r.priceTokens.map(t=>`${r.chain}:${r.chain==='solana'?t.address:t.address.toLowerCase()}`)));
+  const sourceRows=(data?.priceSourceCoverage??[]).filter(r=>hotTokenKeys.has(`${r.chain}:${r.chain==='solana'?r.asset_address:r.asset_address.toLowerCase()}`));
+  const priceCategories=new Map<string,number>();
+  const depthFailures=new Map<string,number>();
+  for(const pool of selectedHot.filter(p=>p.priced&&!p.depth)){
+    const key=`${pool.chain}:${pool.depthFailure??'OTHER'}`;
+    depthFailures.set(key,(depthFailures.get(key)??0)+1);
+  }
+  for(const pool of selectedHot)for(const token of pool.priceTokens){
+    const reasons=token.reliable?[token.provenance?.kind==='CROSS_POOL'?'DERIVED_PRICE_OK':'DIRECT_PRICE_OK']:
+      [...new Set(token.failures.length?token.failures.map(f=>f==='NO_SUPPORTED_PRICE_SOURCE'?'NO_SOURCE':f==='UNKNOWN'?'OTHER':f):['NO_SOURCE'])];
+    for(const reason of reasons){const key=`${pool.chain}:${reason}`;priceCategories.set(key,(priceCategories.get(key)??0)+1);}
+  }
   const alerts:string[] = [];
   for (const chain of ["base","bsc"])
     if (data && !data.providers.some((p)=>p.chain===chain && p.supportsGetLogs && p.healthState==="HEALTHY") &&
@@ -93,8 +121,8 @@ export function DataHealthPage() {
         BSC: {data?.readiness.bsc.status??"UNAVAILABLE"}. No strategy recommendations are generated.</p>
       <div className="table-scroll"><table><thead><tr><th>GATE</th><th>STATUS</th><th>ACTUAL</th><th>REQUIRED</th></tr></thead><tbody>
         {(data?.readiness.gates??[]).map((g)=>{
-          const percent=["BASE_LIVE_FEES","HOT_PRICE","HOT_DEPTH","OUTCOME_4H","OUTCOME_24H"].includes(g.id);
-          const duration=["FOREGROUND_P95","FOREGROUND_P99","NEW_OUTCOME_LATENESS"].includes(g.id);
+          const percent=g.hourlyCompliance!==undefined || g.id.startsWith("EPOCH_OUTCOME_") || ["BASE_LIVE_FEES","HOT_PRICE","HOT_DEPTH","OUTCOME_4H","OUTCOME_24H"].includes(g.id);
+          const duration=["FOREGROUND_P95","FOREGROUND_P99","FOREGROUND_MAX"].includes(g.id);
           const show=(v:number|null)=>v==null?"—":percent?`${Math.round(v*100)}%`:
             duration?`${(v/1000).toFixed(1)}s`:g.id==="STORAGE_GROWTH"?`${(v/2**30).toFixed(2)} GiB/day`:
               g.id==="SNAPSHOT_CONTINUITY"?`${v.toFixed(1)}%`:
@@ -103,6 +131,23 @@ export function DataHealthPage() {
           return <tr key={g.id}><td>{g.id.replaceAll("_"," ")}</td><td>{g.pass?"PASS":"FAIL"}</td>
             <td>{show(g.value)}</td><td>{show(g.target)}</td></tr>;
         })}</tbody></table></div></section>
+    <section className="panel"><div className="eyebrow">CLEAN RESEARCH EPOCH</div>
+      <p>Epoch: {data?.researchEpoch?.id??"No epoch started"} · {data?.researchEpoch?.status??"UNAVAILABLE"} ·
+        run: {data?.burninRunId??"No validation run"}.</p>
+      {data?.researchEpoch&&<p>Started {new Date(data.researchEpoch.startedAt).toLocaleString()} ·
+        ended {data.researchEpoch.endedAt?new Date(data.researchEpoch.endedAt).toLocaleString():"Open"} ·
+        {data.researchEpoch.chainSet.join(", ")} · {data.researchEpoch.reason}
+        {data.researchEpoch.invalidationReason?` · Invalidated: ${data.researchEpoch.invalidationReason}`:""}.</p>}
+      {data?.researchEpoch&&<details><summary>Epoch methodology versions</summary><p>{Object.entries(data.researchEpoch.methodologyVersions).map(([name,version])=>`${name}: ${version}`).join(" · ")}</p></details>}
+      <p>Mature STANDARD-confidence outcomes. Complete means PRICE_RANGE_COMPLETE; partial observations do not count. Historical evidence remains available.</p>
+      <div className="table-scroll"><table><thead><tr><th>COHORT</th><th>HORIZON</th><th>MATURE ELIGIBLE</th><th>PRICE / RANGE COMPLETE</th><th>PARTIAL</th><th>MISSING</th></tr></thead><tbody>
+        {([['CURRENT_RESEARCH_EPOCH',data?.currentEpochOutcomes??[]],['ALL_HISTORY',data?.allHistoryOutcomes??[]]] as const).flatMap(([cohort,rows])=>rows.map(r=><tr key={`${cohort}:${r.horizon}`}>
+          <td>{cohort}</td><td>{r.horizon}</td><td>{r.eligible}</td><td>{ratio(r.priceRangeComplete,r.eligible)}</td><td>{r.partial}</td><td>{r.missing}</td></tr>))}
+      </tbody></table></div></section>
+    <section className="panel"><div className="eyebrow">REQUIRED PROVIDER SERVICES · SOLANA + BASE</div>
+      <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>SERVICE</th><th>STATUS</th><th>REQUIRED</th><th>FRESH SOURCES</th><th>REASON</th></tr></thead><tbody>
+        {(data?.providerServices??[]).map(s=><tr key={`${s.chain}:${s.service}`}><td>{s.chain}</td><td>{s.service}</td><td>{s.state}</td><td>{yes(s.required)}</td><td>{s.sources.join(", ")||"None"}</td><td>{s.reason??"—"}</td></tr>)}
+      </tbody></table></div></section>
     <section className="panel"><div className="eyebrow">CONTINUOUS CORE SNAPSHOTS</div>
       <p>{data?.snapshotCoverage.actual??"—"}/{data?.snapshotCoverage.expected??"—"} expected ·
         {data?.snapshotCoverage.coveragePct==null?" —":` ${data.snapshotCoverage.coveragePct.toFixed(1)}%`} cadence coverage ·
@@ -131,19 +176,57 @@ export function DataHealthPage() {
         Readiness requires 24 hours of measured total allocation, including indexes and WAL.</p></section>
     <section className="panel"><div className="eyebrow">HOT-POOL CURRENT COVERAGE</div>
       <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>HOT POOLS</th><th>RELIABLY PRICED</th>
-        <th>±5% DEPTH</th><th>CURRENT 1H FEES</th></tr></thead><tbody>
+        <th>±5% DEPTH / PRICED</th><th>±5% DEPTH / ALL HOT</th><th>CURRENT 1H FEES</th></tr></thead><tbody>
         {(data?.hotCoverage??[]).map((r)=><tr key={r.chain}><td>{r.chain}</td><td>{r.pools}</td>
-          <td>{r.priced}</td><td>{r.depth5}</td><td>{r.fee1h}</td></tr>)}</tbody></table></div>
+          <td>{ratio(r.priced,r.pools)}</td><td>{r.depth5Priced==null?"Unavailable":ratio(r.depth5Priced,r.priced)}</td>
+          <td>{ratio(r.depth5,r.pools)}</td><td>{ratio(r.fee1h,r.pools)}</td></tr>)}</tbody></table></div>
       <p>Independent live workers: {(data?.liveRuns??[]).map((r)=>
         `${r.chain} ${r.status}, ${r.swaps} swaps/${r.pools} pools${r.error?` (${r.error})`:""}`).join(" · ")||"Starting"}</p></section>
     <section className="panel"><div className="eyebrow">HOT ACTIVE COVERAGE</div>
       <p>{(data?.hotCoverage??[]).map(r=>`${r.chain}: all HOT ${r.pools}; active or missing ${r.activePools}; fresh cursors ${r.activeFresh}/${r.activePools}; complete 1h fees ${r.activeFee1h}/${r.activePools}`).join(' · ')}. Only proven NO_ACTIVITY pools leave the active denominator.</p>
       <div className="table-scroll"><table><thead><tr><th>POOL</th><th>ACTIVITY</th><th>CURSOR</th><th>LAG</th><th>PRICE</th><th>DEPTH</th><th>TOKEN PRICE EVIDENCE</th></tr></thead><tbody>
         {(data?.hotPoolDetails??[]).filter(r=>['base','solana'].includes(r.chain)).map(r=><tr key={r.poolId}>
-          <td>{r.chain} {r.poolId.slice(-12)}</td><td>{r.activity}</td><td>{r.reason}</td><td>{r.lagSeconds==null?'Unavailable':`${Math.round(r.lagSeconds)}s`}</td>
-          <td>{r.priced?'Reliable':'Unavailable'}</td><td>{r.depth?'Current':'Unavailable'}</td>
-          <td>{r.priceTokens.map(t=>`${t.symbol||t.address.slice(-8)}: ${t.reliable?'reliable':t.failures.join(', ')||'UNKNOWN'}${t.provenance?' · provenance recorded':''}`).join(' · ')}</td>
+          <td><Link href={`/pool/${encodeURIComponent(r.poolId)}`}>{r.chain} {r.poolId.slice(-12)}</Link></td><td>{r.activity}</td><td>{r.cursorState??r.reason}</td><td>{r.lagSeconds==null?'Unavailable':`${Math.round(r.lagSeconds)}s`}</td>
+          <td>{r.priced?'Reliable':'Unavailable'}</td><td>{r.depth?'Current':r.depthFailure??'Unavailable'}</td>
+          <td>{r.priceTokens.map(t=>`${t.symbol||t.address.slice(-8)}: ${t.reliable?(t.provenance?.kind==='CROSS_POOL'?'DERIVED_PRICE_OK':'DIRECT_PRICE_OK'):t.failures.join(', ')||'NO_SOURCE'}`).join(' · ')}</td>
         </tr>)}</tbody></table></div></section>
+    <section className="panel"><div className="eyebrow">RELIABLE PAIR PRICING · EXPLICIT HOT DENOMINATORS</div>
+      <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>COHORT</th><th>RELIABLY PRICED / ELIGIBLE</th></tr></thead><tbody>
+        {(data?.hotCoverage??[]).filter(r=>['solana','base'].includes(r.chain)).flatMap(r=>[
+          <tr key={`${r.chain}:all`}><td>{r.chain}</td><td>ALL HOT</td><td>{ratio(r.priced,r.pools)}</td></tr>,
+          <tr key={`${r.chain}:active`}><td>{r.chain}</td><td>HOT ACTIVE</td><td>{r.activePriced==null?"Unavailable":ratio(r.activePriced,r.activePools)}</td></tr>,
+          <tr key={`${r.chain}:signal`}><td>{r.chain}</td><td>HOT SIGNAL</td><td>{r.signalPriced==null||r.signalPools==null?"Unavailable":ratio(r.signalPriced,r.signalPools)}</td></tr>,
+        ])}
+      </tbody></table></div><p>Signal and active cohorts are shown alongside all HOT pools; no failed pool disappears from the all-HOT denominator.</p></section>
+    <section className="panel"><div className="eyebrow">BASE CURSOR LAG · LABELED DENOMINATORS</div>
+      <div className="table-scroll"><table><thead><tr><th>COHORT</th><th>POOLS</th><th>KNOWN / UNKNOWN</th><th>MEDIAN</th><th>P90</th><th>P95</th><th>MAX</th></tr></thead><tbody>
+        {data?.baseLag&&([['HOT ACTIVE',data.baseLag.hotActive],['ALL HOT',data.baseLag.allHot],['PROVEN NO ACTIVITY',data.baseLag.noActivity]] as const).map(([name,lag])=><tr key={name}>
+          <td>{name}</td><td>{lag.total}</td><td>{lag.known} / {lag.unknown}</td><td>{seconds(lag.median)}</td><td>{seconds(lag.p90)}</td><td>{seconds(lag.p95)}</td><td>{seconds(lag.max)}</td></tr>)}
+      </tbody></table></div>
+      <p>Infrastructure failures remain in the active denominator unless zero activity is proven by complete ingestion.</p></section>
+    <section className="panel"><div className="eyebrow">BASE CURRENT 1H FEE WATERFALL</div>
+      {data?.baseFeeWaterfall?<p>All HOT {data.baseFeeWaterfall.allHot} · HOT ACTIVE {data.baseFeeWaterfall.active}
+        {" → "}live events complete {data.baseFeeWaterfall.eventComplete}{" → "}swap prices complete {data.baseFeeWaterfall.swapPricesComplete}
+        {" → "}fee window complete {ratio(data.baseFeeWaterfall.feeComplete,data.baseFeeWaterfall.active)}.</p>:<p>Unavailable</p>}
+      <div className="table-scroll"><table><thead><tr><th>INCOMPLETE ACTIVE POOL</th><th>FAILURE</th><th>UNPRICED SWAPS</th></tr></thead><tbody>
+        {(data?.baseFeeWaterfall?.failures??[]).map(r=><tr key={r.poolId}><td><Link href={`/pool/${encodeURIComponent(r.poolId)}`}>{r.poolId}</Link></td><td>{r.reason??"OTHER"}</td><td>{r.unpricedSwaps}</td></tr>)}
+      </tbody></table></div></section>
+    <section className="panel"><div className="eyebrow">HOT TOKEN PRICE WATERFALL · SOLANA + BASE</div>
+      <p>Counts are pool-token legs; a shared token can occur in several pools. Failed legs can have multiple recorded causes. Direct and derived successes are separated.</p>
+      <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>RESULT / FAILURE</th><th>POOL-TOKEN LEGS</th></tr></thead><tbody>
+        {[...priceCategories].sort(([a],[b])=>a.localeCompare(b)).map(([key,count])=>{const [chain,reason]=key.split(":");return <tr key={key}><td>{chain}</td><td>{reason}</td><td>{count}</td></tr>;})}
+      </tbody></table></div>
+      <details><summary>HOT price source coverage map · {sourceRows.length} source records</summary>
+        <p>Publication latency measures lookup time minus the source publication timestamp. Missing metadata remains unavailable.</p>
+        <div className="table-scroll"><table><thead><tr><th>CHAIN + TOKEN ADDRESS</th><th>SOURCE</th><th>DIRECT / DERIVED</th><th>LAST SUCCESS</th><th>LAST FAILURE</th><th>FAILURE</th><th>RESOLUTION</th><th>PUBLICATION LATENCY</th><th>CONFIDENCE</th></tr></thead><tbody>
+          {sourceRows.map(r=><tr key={`${r.chain}:${r.asset_address}:${r.source}`}><td>{r.chain} {r.asset_address}</td><td>{r.source}</td><td>{r.kind??"Unavailable"}</td>
+            <td>{age(r.last_success,data?.generatedAt??0)}</td><td>{age(r.last_failure,data?.generatedAt??0)}</td><td>{r.failure_reason??"—"}</td><td>{r.coverage_resolution??"Unavailable"}</td>
+            <td>{r.publication_latency_ms==null?"Unavailable":`${(r.publication_latency_ms/1000).toFixed(1)}s`}</td><td>{r.confidence??"Unavailable"}</td></tr>)}
+        </tbody></table></div></details></section>
+    <section className="panel"><div className="eyebrow">PRICED HOT POOLS · ±5% DEPTH FAILURES</div>
+      <div className="table-scroll"><table><thead><tr><th>CHAIN</th><th>FAILURE</th><th>POOLS</th></tr></thead><tbody>
+        {[...depthFailures].sort(([a],[b])=>a.localeCompare(b)).map(([key,count])=>{const [chain,reason]=key.split(":");return <tr key={key}><td>{chain}</td><td>{reason}</td><td>{count}</td></tr>;})}
+      </tbody></table></div><p>Only reliably-priced pools without current depth appear here; unpriced pools remain in the absolute HOT denominator.</p></section>
     <section className="panel"><div className="eyebrow">BSC SOURCE CAPABILITIES</div>
       <p>Live logs: {data?.bscSource.liveLogs?"YES":"NO"} · Historical logs: {data?.bscSource.historicalLogs?"YES":"NO"} ·
         Archive state: {data?.bscSource.archiveState?"YES":"NO"} · WebSocket: {data?.bscSource.websocket??"DISABLED"}.</p>

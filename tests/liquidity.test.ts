@@ -161,6 +161,16 @@ describe("batched on-chain enrichment", () => {
       malformed?: boolean;
       wrongChain?: boolean;
       missingPrice?: boolean;
+      token0?: string;
+      token1?: string;
+      decimals0?: number;
+      decimals1?: number;
+      balanceFailure?: boolean;
+      malformedBalance?: boolean;
+      balance0?: bigint;
+      balance1?: bigint;
+      reorg?: boolean;
+      liquidity?: bigint;
     } = {},
   ) {
     const block = {
@@ -178,24 +188,31 @@ describe("batched on-chain enrichment", () => {
               calls.push(r.params);
               let result: unknown;
               if (r.method === "eth_chainId") result = options.wrongChain ? "0x38" : "0x2105";
-              else if (r.method === "eth_getBlockByNumber") result = block;
+              else if (r.method === "eth_getBlockByNumber") result = options.reorg && r.params[0] === block.number
+                ? { ...block, hash: "0x" + "b".repeat(64) } : block;
               else {
                 const data = (r.params[0] as { data: string }).data;
                 const [inner] = multicallAbi.decodeFunctionData("aggregate3", data);
                 result = multicallAbi.encodeFunctionResult("aggregate3", [
-                  inner.map((c: { callData: string }) => {
+                  inner.map((c: { target: string; callData: string }) => {
                     let value = (
                       {
                         "0x3850c7bd": abi(2n ** 96n, 0n, 0n, 1n, 1n, 0n, 1n),
-                        "0x1a686502": abi(1000000n),
-                        "0x0dfe1681": abi(BigInt(a)),
-                        "0xd21220a7": abi(BigInt(b)),
+                        "0x1a686502": abi(options.liquidity ?? 1000000n),
+                        "0x0dfe1681": abi(BigInt(options.token0 ?? a)),
+                        "0xd21220a7": abi(BigInt(options.token1 ?? b)),
                         "0xddca3f43": abi(500n),
                         "0xd0c93a7c": abi(10n),
                         "0xc45a0155": abi(BigInt(evmNetworks.base.factory)),
-                        "0x313ce567": abi(6n),
+                        "0x313ce567": abi(BigInt(c.target.toLowerCase() === (options.token0 ?? a).toLowerCase()
+                          ? options.decimals0 ?? 6 : options.decimals1 ?? 6)),
                       } as Record<string, string>
                     )[c.callData];
+                    if (c.callData.startsWith("0x70a08231")) {
+                      if (options.balanceFailure) return [false, "0x"];
+                      value = options.malformedBalance ? "0x123" : abi(c.target.toLowerCase() ===
+                        (options.token0 ?? a).toLowerCase() ? options.balance0 ?? 250000000000n : options.balance1 ?? 300000000000n);
+                    }
                     if (options.malformed && c.callData === "0x3850c7bd") value = "0x123";
                     return [true, value];
                   }),
@@ -233,6 +250,7 @@ describe("batched on-chain enrichment", () => {
       await enrichEvmLiquidity([p], "base", test.rpc);
       expect(p.activeLiquidityUsd).toBeNull();
       expect(p.activeLiquiditySource).toBe("UNAVAILABLE");
+      expect(p.pairState).toBeUndefined();
     },
   );
   it("leaves unavailable when token pricing is absent", async () => {
@@ -242,6 +260,65 @@ describe("batched on-chain enrichment", () => {
     await enrichEvmLiquidity([p], "base", rpc().rpc);
     expect(p.activeLiquidityUsd).toBeNull();
     expect(p.activeLiquidityReason).toMatch(/pricing/);
+    expect(p.pairState?.depositedToken0Amount).toBe(250000);
+    expect(p.pairState?.depositedLiquidityUsd).toBe(0);
+  });
+  it("captures pinned actual custody with 6/18 decimals despite missing analyzed-token USD", async () => {
+    vi.setSystemTime(now);
+    const p = pool(), anchor = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const other = "0x0000000000000000000000000000000000000099";
+    p.token0.address = p.token0Address = anchor;
+    p.token0.usdPriceSource = "DefiLlama Coins API";
+    p.token0.usdPriceSourceTimestamp = now - 1000;
+    p.token1.address = p.token1Address = other;
+    p.token1.usdPrice = null;
+    const test = rpc({ token0: anchor, token1: other, decimals0: 6, decimals1: 18,
+      balance0: 250000000000n, balance1: 3n * 10n ** 18n });
+    await enrichEvmLiquidity([p], "base", test.rpc);
+    expect(p.activeLiquidityUsd).toBeNull();
+    expect(p.pairState).toMatchObject({ token0Address: anchor, token1Address: other,
+      depositedToken0Amount: 250000, depositedToken1Amount: 3, depositedLiquidityUsd: 250000,
+      blockNumber: "0x123", sourceTimestamp: now - 1000,
+      execution:{kind:"V3_CURRENT_RANGE",sqrtPriceX96:(2n ** 96n).toString(),
+        liquidityRaw:"1000000",tick:0,tickSpacing:10,decimals0:6,decimals1:18} });
+    expect(p.pairState?.source).toContain("not tradable reserves");
+    const aggregates = test.calls.filter((c) => typeof c[0] === "object");
+    expect(aggregates.every((c) => c[1] === "0x123")).toBe(true);
+    const balances = aggregates.flatMap((c) => {
+      const [inner] = multicallAbi.decodeFunctionData("aggregate3", (c[0] as { data: string }).data);
+      return inner.filter((r: { callData: string }) => r.callData.startsWith("0x70a08231"));
+    });
+    expect(balances).toHaveLength(2);
+    expect(balances.every((r: { callData: string }) => r.callData.endsWith(p.poolAddress.slice(2)))).toBe(true);
+    expect(test.calls.at(-1)?.[0]).toBe("0x123");
+  });
+  it.each([{ balanceFailure: true }, { malformedBalance: true }])(
+    "does not replace missing custody with virtual reserves or TVL: %j", async (options) => {
+      vi.setSystemTime(now);
+      const p = pool();
+      p.tvlUsd = 100000000;
+      await enrichEvmLiquidity([p], "base", rpc(options).rpc);
+      expect(p.activeLiquidityUsd).toBe(2);
+      expect(p.pairState).toBeUndefined();
+    });
+  it("retains a verified zero custody balance and rejects reorg evidence", async () => {
+    vi.setSystemTime(now);
+    const p = pool();
+    await enrichEvmLiquidity([p], "base", rpc({ balance0: 0n, balance1: 0n }).rpc);
+    expect(p.pairState?.depositedToken0Amount).toBe(0);
+    expect(p.pairState?.depositedLiquidityUsd).toBe(0);
+    await enrichEvmLiquidity([p], "base", rpc({ reorg: true }).rpc);
+    expect(p.pairState).toBeUndefined();
+    expect(p.activeLiquidityUsd).toBeNull();
+  });
+  it("preserves raw zero in-range liquidity without deriving infinite execution reserves", async () => {
+    vi.setSystemTime(now);
+    const p = pool();
+    await enrichEvmLiquidity([p], "base", rpc({ liquidity:0n }).rpc);
+    expect(p.activeLiquidityUsd).toBe(0);
+    expect(p.pairState?.execution).toMatchObject({liquidityRaw:"0",sqrtPriceX96:(2n ** 96n).toString()});
+    expect(Number.isFinite(p.pairState!.pairPrice)).toBe(true);
+    expect(Number.isFinite(p.pairState!.depositedToken0Amount)).toBe(true);
   });
   it("rejects malformed batches, duplicate ids and write methods", async () => {
     for (const body of [

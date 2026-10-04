@@ -7,8 +7,10 @@ import {
   priceEvidence,
   unavailableLiquidity,
   usdValue,
+  tokenUnits,
   v3VirtualAmounts,
 } from "../core/liquidity";
+import { approvedReferenceAssets } from "../core/pricing";
 import { env } from "../config/env";
 import {
   ReadOnlyRpc,
@@ -113,6 +115,7 @@ export async function enrichEvmLiquidity(
   const network = evmNetworks[chain];
   const targets = pools.slice(0, env.ACTIVE_LIQUIDITY_EVM_LIMIT);
   for (const pool of pools) feeMetadata.delete(pool);
+  for (const pool of targets) pool.pairState = undefined;
   for (const p of pools)
     unavailableLiquidity(
       p,
@@ -180,11 +183,24 @@ export async function enrichEvmLiquidity(
     const missingDecimals = addresses.filter(
       (address) => (decimalsCache.get(`${chain}:${address}`)?.until ?? 0) <= Date.now(),
     );
-    const rawDecimals = await readContracts(
-      rpc,
-      missingDecimals.map((to) => ({ to, data: "0x313ce567" })),
-      block.number,
-    );
+    const decimalCalls = missingDecimals.map((to) => ({ to, data: "0x313ce567" }));
+    const balances = decoded.flatMap((state) => state ? [state, state] : []);
+    const balanceCalls = balances.map((state, i) => ({
+      to: i % 2 === 0 ? state.token0 : state.token1,
+      data: `0x70a08231${state.pool.poolAddress.slice(2).toLowerCase().padStart(64, "0")}`,
+    }));
+    let tokenReads: unknown[];
+    try {
+      tokenReads = await readContracts(rpc, [...decimalCalls, ...balanceCalls], block.number);
+    } catch {
+      // Custody evidence is optional; an unavailable balance read must not disable liquidity valuation.
+      tokenReads = await readContracts(rpc, decimalCalls, block.number);
+    }
+    const rawDecimals = tokenReads.slice(0, missingDecimals.length);
+    const custodyBalances = new Map<Pool, [unknown, unknown]>();
+    for (let i = 0; i < balances.length; i += 2)
+      custodyBalances.set(balances[i].pool, [tokenReads[missingDecimals.length + i],
+        tokenReads[missingDecimals.length + i + 1]]);
     // Re-read this exact block hash after all calls to catch a reorg or inconsistent backend.
     const finalBlock = blockSchema.parse(
       await rpc.call("eth_getBlockByNumber", [block.number, false]),
@@ -226,6 +242,42 @@ export async function enrichEvmLiquidity(
         feeMetadata.set(pool, { token0Address: state.token0, token1Address: state.token1,
           decimals0: d0, decimals1: d1, feeTier: state.fee / 1e6,
           blockNumber: block.number, blockTime });
+        try {
+          const custody = custodyBalances.get(pool)!;
+          const amount0 = tokenUnits(words(custody[0], 1)[0].toString(), d0);
+          const amount1 = tokenUnits(words(custody[1], 1)[0].toString(), d1);
+          const observedAt = Math.max(now, Date.now());
+          const referenceTime = (token: typeof t0): number | null => {
+            const sources = token.priceProvenance?.sources ?? [token.usdPriceSource ?? ""];
+            if (!(approvedReferenceAssets[chain] ?? []).includes(token.address.toLowerCase()) ||
+                !["HIGH", "MEDIUM"].includes(token.usdPriceConfidence ?? "UNAVAILABLE") ||
+                token.priceProvenance?.kind === "CROSS_POOL" ||
+                !sources.length || !sources.every((source) => /^(DefiLlama|CoinGecko|Pyth)/.test(source)) ||
+                token.usdPrice == null || !Number.isFinite(token.usdPrice) || token.usdPrice <= 0 ||
+                !fresh(token.usdPriceSourceTimestamp, observedAt, env.PRICE_MEDIUM_AGE_SECONDS * 1000) ||
+                !fresh(token.usdPriceObservedAt, observedAt, env.ACTIVE_LIQUIDITY_PRICE_MAX_AGE_SECONDS * 1000) ||
+                Math.abs(token.usdPriceSourceTimestamp! - blockTime) > env.CROSS_PRICE_MAX_ALIGNMENT_SECONDS * 1000) return null;
+            return token.usdPriceSourceTimestamp!;
+          };
+          const reference0 = referenceTime(t0), reference1 = referenceTime(t1);
+          const lowerBound = amount0.mul(reference0 == null ? 0 : t0.usdPrice!)
+            .plus(amount1.mul(reference1 == null ? 0 : t1.usdPrice!)).toNumber();
+          const numeric0 = amount0.toNumber(), numeric1 = amount1.toNumber();
+          if (!Number.isFinite(numeric0) || !Number.isFinite(numeric1) ||
+              !Number.isFinite(lowerBound)) throw new Error("Invalid custody balance");
+          // Whole-contract custody includes fees and out-of-range deposits; it is not tradable reserves.
+          pool.pairState = { pairPrice: amounts.pairPrice.toNumber(), sourceTimestamp: blockTime,
+            observedAt, blockNumber: block.number, token0Address: state.token0,
+            token1Address: state.token1, depositedToken0Amount: numeric0, depositedToken1Amount: numeric1,
+            depositedLiquidityUsd: lowerBound,
+            execution: {kind:"V3_CURRENT_RANGE",sqrtPriceX96:state.sqrt,
+              liquidityRaw:state.liquidity,tick:state.tick,tickSpacing:state.spacing,
+              decimals0:d0,decimals1:d1},
+            liquiditySourceTimestamp: Math.min(blockTime, reference0 ?? blockTime, reference1 ?? blockTime),
+            source: "EVM pinned ERC20 balanceOf pool custody (not tradable reserves)" };
+        } catch {
+          // Malformed or unsupported token balance cannot manufacture reference liquidity.
+        }
         const pricing = priceEvidence(
           t0,
           t1,

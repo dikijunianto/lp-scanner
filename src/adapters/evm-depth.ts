@@ -49,6 +49,7 @@ export function depthRefreshMs(pool: Pool, watched: boolean, activeSignal: boole
 export function depthTargets(pools: Pool[], store: Store, cacheOnly: boolean,
   watched: Set<string>, limit: number) {
   const active = store.activeSignalIds();
+  const queued=new Set(store.pendingDepthIds());
   const rows = pools.map((pool) => ({pool,old:store.latestDepth(pool.id)}));
   if (cacheOnly) return rows;
   return rows.filter(({pool,old})=>{
@@ -61,7 +62,7 @@ export function depthTargets(pools: Pool[], store: Store, cacheOnly: boolean,
     return old.stateKey!==key || Date.now()-old.updatedAt>=depthRefreshMs(pool,watched.has(pool.id),active.has(pool.id))
       || (depthDriftPct(old.priceAtCalculation,pool.price)??Infinity)>env.DEPTH_PRICE_DRIFT_PCT;
   }).sort((a,b) => {
-    const score = (x: typeof a) => (watched.has(x.pool.id) ? 100000 : active.has(x.pool.id) ? 80000 : 0)
+    const score = (x: typeof a) => (queued.has(x.pool.id)?1000000:0) + (watched.has(x.pool.id) ? 100000 : active.has(x.pool.id) ? 80000 : 0)
       + (4-priorityTier(x.pool,false,undefined,priorityPolicy()))*10000
       + (!x.old ? 5000 : Math.min(4000,(Date.now()-x.old.updatedAt)/60000));
     return score(b)-score(a);
